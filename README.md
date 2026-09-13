@@ -1,4 +1,4 @@
-![aetelier](assets/images/aetelier_banner.png)
+![aetelier](assets/images/aetelier-github-social-1280x640-light.png)
 
 <br>
 
