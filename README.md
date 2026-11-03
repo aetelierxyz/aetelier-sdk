@@ -1,4 +1,4 @@
-![aetelier](assets/images/aetelier_banner.png)
+![aetelier](assets/images/aetelier-github-social-1280x640-light.png)
 
 <br>
 
@@ -6,10 +6,10 @@
 [![Rust][badge-rust]][url-rust]
 [![Apache-2.0 licensed][badge-license]][url-license]
 
-[badge-build]: https://github.com/IteraLabs/aetelier-sdk/actions/workflows/ci.yml/badge.svg
-[url-build]: https://github.com/IteraLabs/aetelier-sdk/actions/workflows/ci.yml
+[badge-build]: https://github.com/aetelierxyz/aetelier-sdk/actions/workflows/ci.yml/badge.svg
+[url-build]: https://github.com/aetelierxyz/aetelier-sdk/actions/workflows/ci.yml
 [badge-rust]: https://img.shields.io/badge/rust-1.88%2B-orange.svg?maxAge=3600
-[url-rust]: https://github.com/IteraLabs/aetelier-sdk
+[url-rust]: https://github.com/aetelierxyz/aetelier-sdk
 [badge-license]: https://img.shields.io/badge/license-Apache--2.0-00baf5.svg
 [url-license]: LICENSE
 
@@ -64,7 +64,7 @@ Depend on the workspace via git, pinned to the release tag:
 
 ```toml
 [dependencies]
-aetelier-sdk = { git = "https://github.com/IteraLabs/aetelier-sdk", tag = "v0.1.1", features = ["parquet"] }
+aetelier-sdk = { git = "https://github.com/aetelierxyz/aetelier-sdk", tag = "v0.1.1", features = ["parquet"] }
 ```
 
 The six crates carry the layout and publish order for a registry release; [CONTRIBUTING.md](CONTRIBUTING.md) documents both.

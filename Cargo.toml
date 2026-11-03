@@ -16,13 +16,13 @@ default-members = [
 
 [workspace.package]
 version = "0.1.1"
-authors = ["iteralabs.xyz"]
+authors = ["aetelier.xyz"]
 edition = "2024"
 rust-version = "1.99.0"
 description = "Rust engine for high-frequency market-microstructure data: exchange connectivity, ingestion, synchronization, and columnar I/O."
 license = "Apache-2.0"
 homepage = "https://aetelier.xyz"
-repository = "https://github.com/iteralabs/aetelier-sdk"
+repository = "https://github.com/aetelierxyz/aetelier-sdk"
 readme = "README.md"
 keywords = ["crypto", "framework", "machine-learning", "math", "trading"]
 categories = ["data-structures", "development-tools", "finance", "simulation"]
