@@ -53,7 +53,6 @@
 //! |------|--------|
 //! | `parquet` | Parquet read/write plus the `FlushToParquet` persistence surface. |
 //! | `connect` | The `FlushToParquet` trait against live worker output. |
-//! | `torch`   | `tch` tensor conversion in `aetelier_io` (experimental). |
 
 pub mod error;
 pub use error::AetelierError;

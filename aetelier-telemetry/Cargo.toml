@@ -24,15 +24,15 @@ path = "tests/test_attributes.rs"
 
 [dependencies]
 thiserror = { version = "1.0.64" }
-opentelemetry = { version = "0.31" }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio"] }
-opentelemetry-stdout = { version = "0.31", features = ["metrics"] }
+opentelemetry = { version = "0.32" }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "metrics"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }
+opentelemetry-stdout = { version = "0.32", features = ["metrics"] }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 toml = { version = "0.8" }
 tracing = { version = "0.1" }
-tracing-opentelemetry = { version = "0.32" }
+tracing-opentelemetry = { version = "0.33" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

@@ -73,7 +73,6 @@ parquet = [
   "aetelier-io/connect",
   "aetelier-io/parquet"
 ]
-torch = ["aetelier-io/torch"]
 
 [lints]
 workspace = true

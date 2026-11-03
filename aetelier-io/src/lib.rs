@@ -10,7 +10,6 @@
 //! | Flag | Effect |
 //! |------|--------|
 //! | `parquet` | Enables Apache Parquet I/O (adds `arrow` + `parquet` deps). |
-//! | `torch` | Enables `tch`-based tensor conversion in the `datasets` module. |
 //! | `connect` | Enables the `FlushToParquet` extension trait for `MarketSynchronizer`. |
 
 #![allow(clippy::large_enum_variant)]
