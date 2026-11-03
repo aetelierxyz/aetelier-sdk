@@ -5,11 +5,7 @@
 version = 2
 yanked = "warn"
 # Add a RUSTSEC id here (with a comment) to consciously accept one advisory.
-ignore = [
-    # paste is unmaintained (transitive, proc-macro only, build-time).
-    # Removed naturally when its dependents bump; no runtime exposure.
-    "RUSTSEC-2024-0436",
-]
+ignore = []
 
 [bans]
 # The rustls line is single (0.23) after the transport modernization. Remaining
