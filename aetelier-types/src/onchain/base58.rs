@@ -7,7 +7,7 @@ fn digit(symbol: u8) -> Option<u32> {
         .map(|value| value as u32)
 }
 
-pub(crate) fn encode(bytes: &[u8]) -> String {
+pub fn encode(bytes: &[u8]) -> String {
     let zeros = bytes.iter().take_while(|&&byte| byte == 0).count();
     let mut digits: Vec<u8> = Vec::with_capacity(bytes.len() * 138 / 100 + 1);
     for &byte in &bytes[zeros..] {
@@ -81,6 +81,15 @@ mod tests {
         assert_eq!(decode("112"), Some(vec![0, 0, 1]));
         assert_eq!(encode(b"hello world"), "StV1DL6CwTryKyV");
         assert_eq!(decode("StV1DL6CwTryKyV"), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn the_public_encoder_renders_a_signature_like_the_reference_codec() {
+        let signature = [0x5au8; 64];
+        assert_eq!(
+            crate::onchain::encode_base58(&signature),
+            bs58::encode(signature).into_string()
+        );
     }
 
     #[test]

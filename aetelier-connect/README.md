@@ -15,7 +15,7 @@ assert!(registry().get("upbit").is_some());
 
 ## Architecture
 
-- `framework/` — the venue-generic engine: `transport` (WSS pump with staleness and RTT), `adapters/` (13 venue protocol implementations), `model` (reconstruction models and book state machines), `runtime` (seed/reseed/escalation), `feed` (per-subscription FSM), `budget` (SourceMetrics counters), `reconcile` (REST trade recovery), `atlas` (invariant-ID registry backing the conformance coverage check).
+- `framework/` — the venue-generic engine: `transport` (WSS pump with staleness and RTT), `adapters/` (13 venue protocol implementations), `model` (reconstruction models and book state machines), `runtime` (seed/reseed/escalation), `feed` (per-subscription FSM), `budget` (SourceMetrics counters), `reconcile` (REST trade recovery), `atlas` (invariant-ID registry backing the conformance coverage check), `slotbook` (per-bank transaction assembly with height-ordered release and slot-gap accounting), `onchain` (decoded transaction input, address roles and `transactions.v1` row building).
 - `synchronizers/` — grid alignment: `MarketSynchronizer` (clock modes, timestamp-membership attribution, emission hold-back), `ObSynchronizer`, `EventSynchronizer`.
 - `workers/` — `MarketWorker` (the recommended entry point: TOML manifest in, synchronized Parquet out), `DataWorker`, the sink layer (buffered Parquet, channels, terminal), and the gap ledger.
 - `clients/` — reconnect policy (jittered backoff, circuit breaker, health monitoring) and the legacy per-venue clients, deprecated in favor of the framework path.
