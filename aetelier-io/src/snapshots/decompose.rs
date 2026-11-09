@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use aetelier_types::funding::{FundingRate, FundingSettlement};
 use aetelier_types::liquidations::Liquidation;
+use aetelier_types::onchain::{ChainAddress, Transaction};
 use aetelier_types::open_interest::OpenInterest;
 use aetelier_types::orderbooks::Orderbook;
 use aetelier_types::snapshots::MarketSnapshot;
@@ -15,6 +16,7 @@ pub struct DecomposedSnapshots {
     pub funding_rates: Vec<FundingRate>,
     pub open_interests: Vec<OpenInterest>,
     pub funding_settlements: Vec<FundingSettlement>,
+    pub transactions: Vec<Transaction>,
 }
 
 pub fn decompose_snapshots(snapshots: &[MarketSnapshot]) -> DecomposedSnapshots {
@@ -22,6 +24,7 @@ pub fn decompose_snapshots(snapshots: &[MarketSnapshot]) -> DecomposedSnapshots 
     let mut seen_fr: HashSet<(String, String, u64, u64)> = HashSet::new();
     let mut seen_oi: HashSet<(String, String, u64, u64)> = HashSet::new();
     let mut seen_fs: HashSet<(String, String, u64)> = HashSet::new();
+    let mut seen_tx: HashSet<(ChainAddress, String)> = HashSet::new();
 
     for snap in snapshots {
         if let Some(ob) = &snap.orderbook {
@@ -74,6 +77,11 @@ pub fn decompose_snapshots(snapshots: &[MarketSnapshot]) -> DecomposedSnapshots 
                 out.funding_settlements.push(fs.clone());
             }
         }
+        for tx in &snap.transactions {
+            if seen_tx.insert((tx.address, tx.signature.clone())) {
+                out.transactions.push(tx.clone());
+            }
+        }
     }
     out
 }
@@ -120,6 +128,63 @@ mod tests {
             premium: None,
             exchange: "hyperliquid".to_string(),
         }
+    }
+
+    fn tx(address: &str, signature: &str) -> Transaction {
+        use aetelier_types::onchain::{Commitment, MatchRole, TransactionVersion};
+        Transaction {
+            exchange: "solana".to_string(),
+            address: ChainAddress::solana(address).unwrap(),
+            match_role: MatchRole::AccountKey,
+            source_tx_ts_us: 1_791_321_067_000_000,
+            local_tx_ts_us: 0,
+            source_tx_rtt_us: 0,
+            recv_seq: 0,
+            conn_epoch_us: 0,
+            commitment: Commitment::Finalized,
+            slot: 380_000_000,
+            block_height: 358_000_000,
+            blockhash: "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn".to_string(),
+            tx_index: 0,
+            signature: signature.to_string(),
+            version: TransactionVersion::Legacy,
+            success: true,
+            fee_lamports: 5_000,
+            compute_units_consumed: None,
+            compute_unit_limit: None,
+            compute_unit_price_micro_lamports: None,
+            priority_fee_lamports: None,
+            cost_units: None,
+            signers: Vec::new(),
+            account_keys: Vec::new(),
+            log_messages: None,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn transactions_dedup_by_address_and_signature_only() {
+        let jupiter = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+        let whirlpool = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+        let mut snap_a = MarketSnapshot::empty(1_000_000);
+        snap_a.transactions = vec![tx(jupiter, "s1"), tx(jupiter, "s2")];
+        let mut snap_b = MarketSnapshot::empty(2_000_000);
+        snap_b.transactions = vec![tx(jupiter, "s2"), tx(whirlpool, "s2")];
+
+        let out = decompose_snapshots(&[snap_a, snap_b]);
+        let keys: Vec<(String, String)> = out
+            .transactions
+            .iter()
+            .map(|t| (t.address.to_base58(), t.signature.clone()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (jupiter.to_string(), "s1".to_string()),
+                (jupiter.to_string(), "s2".to_string()),
+                (whirlpool.to_string(), "s2".to_string()),
+            ]
+        );
     }
 
     #[test]

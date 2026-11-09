@@ -13,7 +13,7 @@
 //! └── kraken/...
 //! ```
 //!
-//! For every parquet file it runs a battery of 10 tests, then writes an
+//! For every parquet file it runs a battery of 13 tests, then writes an
 //! aggregated report to stdout (human-readable) and to
 //! `--report-out` (JSON), and merges the run into a persistent
 //! `--state-file` so cumulative statistics survive across runs.
@@ -28,8 +28,10 @@
 //!   overlap in time.
 //! * **content correctness** — orderbook snapshots are not crossed
 //!   (best bid < best ask), prices and sizes are strictly positive,
-//!   trade IDs are unique within a file, and orderbook snapshot
-//!   timestamps are unique.
+//!   trade IDs are unique within a file, orderbook snapshot
+//!   timestamps are unique, and transaction rows are unique per
+//!   `(address, signature)`, ordered by `(slot, tx_index)` per address
+//!   and carry their block context.
 //!
 //! Exit code is `0` if every test passed, `1` if any test failed, `2`
 //! on a fatal error (e.g. unreadable state file). Designed to be run
@@ -46,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
 use aetelier_io::naming::{FileKind, FileName, parse_file_name};
+use aetelier_io::onchain::{check_transactions, read_transactions_parquet};
 use aetelier_io::orderbooks::read_ob_parquet;
 use aetelier_io::trades::read_trades_parquet;
 use aetelier_types::orderbooks::{Orderbook, OrderbookTarget, OrderbookTargetData};
@@ -106,7 +109,7 @@ struct Cli {
 // Test catalogue
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Stable IDs for the 10 invariants the validator enforces.
+/// Stable IDs for the 13 invariants the validator enforces.
 ///
 /// Stored verbatim in the state file so historical runs remain
 /// interpretable as the test suite evolves.
@@ -134,6 +137,9 @@ enum TestId {
     /// T10: adjacent files for the same `(exchange, symbol, kind)` do
     /// not overlap in time.
     NoTemporalOverlap,
+    UniqueTransactionKeys,
+    OrderedTransactionPositions,
+    TransactionBlockContext,
 }
 
 impl TestId {
@@ -149,6 +155,9 @@ impl TestId {
             TestId::NotCrossedOrderbook => "T08",
             TestId::PositivePricesSizes => "T09",
             TestId::NoTemporalOverlap => "T10",
+            TestId::UniqueTransactionKeys => "T11",
+            TestId::OrderedTransactionPositions => "T12",
+            TestId::TransactionBlockContext => "T13",
         }
     }
 
@@ -164,6 +173,9 @@ impl TestId {
             TestId::NotCrossedOrderbook => "no_crossed_orderbook",
             TestId::PositivePricesSizes => "positive_prices_and_sizes",
             TestId::NoTemporalOverlap => "no_temporal_overlap_between_files",
+            TestId::UniqueTransactionKeys => "unique_address_signature_per_file",
+            TestId::OrderedTransactionPositions => "slot_index_order_per_address",
+            TestId::TransactionBlockContext => "block_context_and_row_invariants",
         }
     }
 }
@@ -177,13 +189,28 @@ impl TestId {
 enum DataKind {
     Orderbook,
     Trades,
+    Transactions,
 }
 
 impl DataKind {
+    const ALL: [DataKind; 3] = [
+        DataKind::Orderbook,
+        DataKind::Trades,
+        DataKind::Transactions,
+    ];
+
     fn dir_name(&self) -> &'static str {
         match self {
             DataKind::Orderbook => "orderbooks",
             DataKind::Trades => "trades",
+            DataKind::Transactions => aetelier_io::onchain::DATATYPE_DIR,
+        }
+    }
+
+    fn expected_for(exchange: &str) -> &'static [DataKind] {
+        match exchange {
+            "solana" => &[DataKind::Transactions],
+            _ => &[DataKind::Orderbook, DataKind::Trades],
         }
     }
 }
@@ -228,6 +255,8 @@ struct RunSummary {
     bytes_seen: u64,
     total_orderbook_snapshots: u64,
     total_trades: u64,
+    #[serde(default)]
+    total_transactions: u64,
     tests_passed: u64,
     tests_failed: u64,
     failed_test_codes: Vec<String>,
@@ -240,6 +269,8 @@ struct Cumulative {
     bytes: u64,
     orderbook_snapshots: u64,
     trades: u64,
+    #[serde(default)]
+    transactions: u64,
     per_exchange: BTreeMap<String, ExchangeStats>,
 }
 
@@ -249,6 +280,8 @@ struct ExchangeStats {
     bytes: u64,
     orderbook_snapshots: u64,
     trades: u64,
+    #[serde(default)]
+    transactions: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +311,7 @@ fn main() -> Result<()> {
     let exchanges = discover_exchanges(&cli.data_dir, &cli.expect_exchanges);
     let mut t01_failures: Vec<String> = Vec::new();
     for ex in &cli.expect_exchanges {
-        for kind in [DataKind::Orderbook, DataKind::Trades] {
+        for &kind in DataKind::expected_for(ex) {
             let dir = cli.data_dir.join(ex).join(kind.dir_name());
             let count = parquet_files_in(&dir).len();
             if count == 0 {
@@ -297,12 +330,13 @@ fn main() -> Result<()> {
     let mut bytes_seen = 0u64;
     let mut total_ob_snapshots = 0u64;
     let mut total_trades = 0u64;
+    let mut total_transactions = 0u64;
 
     // For T10: group end-state per (exchange, symbol, kind).
     let mut per_group: PerGroupRows = BTreeMap::new();
 
     for ex in &exchanges {
-        for kind in [DataKind::Orderbook, DataKind::Trades] {
+        for kind in DataKind::ALL {
             let dir = cli.data_dir.join(ex).join(kind.dir_name());
             for path in parquet_files_in(&dir) {
                 let path_str = path.to_string_lossy().into_owned();
@@ -345,10 +379,10 @@ fn main() -> Result<()> {
                     }
                 };
 
-                if matches!(kind, DataKind::Orderbook) {
-                    total_ob_snapshots += report.distinct_ts_count;
-                } else {
-                    total_trades += report.row_count;
+                match kind {
+                    DataKind::Orderbook => total_ob_snapshots += report.distinct_ts_count,
+                    DataKind::Trades => total_trades += report.row_count,
+                    DataKind::Transactions => total_transactions += report.row_count,
                 }
 
                 per_group
@@ -401,6 +435,7 @@ fn main() -> Result<()> {
     state.cumulative.bytes = state.known_files.values().sum();
     state.cumulative.orderbook_snapshots += total_ob_snapshots;
     state.cumulative.trades += total_trades;
+    state.cumulative.transactions += total_transactions;
 
     for fr in &file_reports {
         let stats = state
@@ -413,6 +448,7 @@ fn main() -> Result<()> {
         match fr.kind {
             DataKind::Orderbook => stats.orderbook_snapshots += fr.distinct_ts_count,
             DataKind::Trades => stats.trades += fr.row_count,
+            DataKind::Transactions => stats.transactions += fr.row_count,
         }
     }
 
@@ -425,6 +461,7 @@ fn main() -> Result<()> {
         bytes_seen,
         total_orderbook_snapshots: total_ob_snapshots,
         total_trades,
+        total_transactions,
         tests_passed,
         tests_failed,
         failed_test_codes: failed_codes.clone(),
@@ -484,6 +521,7 @@ fn validate_file(
     let (row_count, distinct_ts, first_ts, last_ts, monotonic, sub_failed) = match kind {
         DataKind::Orderbook => validate_orderbook_file(path)?,
         DataKind::Trades => validate_trades_file(path)?,
+        DataKind::Transactions => validate_transactions_file(path)?,
     };
     failed.extend(sub_failed);
 
@@ -507,7 +545,7 @@ fn validate_file(
         // less than the full window).
         let in_range = match kind {
             DataKind::Orderbook => (span_us as f64) >= lo && (span_us as f64) <= hi,
-            DataKind::Trades => (span_us as f64) <= hi,
+            DataKind::Trades | DataKind::Transactions => (span_us as f64) <= hi,
         };
         if !in_range {
             failed.push(TestId::FlushSpan.code());
@@ -664,6 +702,60 @@ fn validate_trades_file(path: &Path) -> Result<FileValidation> {
     ))
 }
 
+fn validate_transactions_file(path: &Path) -> Result<FileValidation> {
+    let rows = read_transactions_parquet(path)
+        .map_err(|e| anyhow::anyhow!("read_transactions_parquet: {e}"))?;
+    if rows.is_empty() {
+        return Ok((0, 0, 0, 0, true, vec![]));
+    }
+    let first_ts = rows.first().map(|t| t.effective_ts_us()).unwrap_or(0);
+    let last_ts = rows.last().map(|t| t.effective_ts_us()).unwrap_or(0);
+    let monotonic = rows
+        .windows(2)
+        .all(|w| w[0].effective_ts_us() <= w[1].effective_ts_us());
+    let distinct_ts: HashSet<u64> = rows.iter().map(|t| t.effective_ts_us()).collect();
+
+    let checks = check_transactions(&rows);
+    let mut failed: Vec<&'static str> = Vec::new();
+    for (count, detail, id) in [
+        (
+            checks.duplicate_keys,
+            &checks.first_duplicate,
+            TestId::UniqueTransactionKeys,
+        ),
+        (
+            checks.out_of_order,
+            &checks.first_out_of_order,
+            TestId::OrderedTransactionPositions,
+        ),
+        (
+            checks.invariant_violations,
+            &checks.first_invariant_violation,
+            TestId::TransactionBlockContext,
+        ),
+    ] {
+        if count > 0 {
+            tracing::warn!(
+                file = %path.display(),
+                test = id.code(),
+                count,
+                first = detail.as_deref().unwrap_or_default(),
+                "validate.transactions_check_failed"
+            );
+            failed.push(id.code());
+        }
+    }
+
+    Ok((
+        checks.rows,
+        distinct_ts.len() as u64,
+        first_ts,
+        last_ts,
+        monotonic,
+        failed,
+    ))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Aggregate test results across files
 // ─────────────────────────────────────────────────────────────────────────────
@@ -712,6 +804,9 @@ fn aggregate_results(
         TestId::UniqueTradeIds,
         TestId::NotCrossedOrderbook,
         TestId::PositivePricesSizes,
+        TestId::UniqueTransactionKeys,
+        TestId::OrderedTransactionPositions,
+        TestId::TransactionBlockContext,
     ] {
         let detail = collect_for(id);
         out.push(TestOutcome {
@@ -774,6 +869,7 @@ fn print_report(
         summary.total_orderbook_snapshots
     );
     println!("│ trades            : {}", summary.total_trades);
+    println!("│ transactions      : {}", summary.total_transactions);
     println!(
         "│ tests_passed      : {}/{}",
         summary.tests_passed,
@@ -830,14 +926,16 @@ fn print_report(
         state.cumulative.orderbook_snapshots
     );
     println!("│ trades            : {}", state.cumulative.trades);
+    println!("│ transactions      : {}", state.cumulative.transactions);
     for (ex, s) in &state.cumulative.per_exchange {
         println!(
-            "│   {:<8} files={:<5} bytes={:<10} ob={:<7} trades={}",
+            "│   {:<8} files={:<5} bytes={:<10} ob={:<7} trades={:<9} txs={}",
             ex,
             s.files,
             human_bytes(s.bytes),
             s.orderbook_snapshots,
             s.trades,
+            s.transactions,
         );
     }
     println!("└─────────────────────────────────────────────────────────────────────");
@@ -910,6 +1008,7 @@ fn matches_convention(path: &Path, kind: DataKind) -> bool {
     let expected_kind = match kind {
         DataKind::Orderbook => FileKind::Orderbook,
         DataKind::Trades => FileKind::Trades,
+        DataKind::Transactions => FileKind::Transactions,
     };
     file_name_of(path)
         .is_some_and(|name| name.mode == "sync" && name.kind == expected_kind)
@@ -1109,5 +1208,132 @@ mod tests {
                 .unwrap();
 
         assert_eq!(report.failed, vec![TestId::FlushSpan.code()]);
+    }
+
+    fn transactions(
+        address: &str,
+        positions: &[(u64, u64, &str)],
+    ) -> Vec<aetelier_types::onchain::Transaction> {
+        use aetelier_types::onchain::{
+            ChainAddress, Commitment, MatchRole, Transaction, TransactionVersion,
+        };
+        positions
+            .iter()
+            .map(|&(slot, tx_index, signature)| Transaction {
+                exchange: "solana".to_string(),
+                address: ChainAddress::solana(address).unwrap(),
+                match_role: MatchRole::AccountKey,
+                source_tx_ts_us: 1_791_321_067_000_000 + slot - 380_000_000,
+                local_tx_ts_us: 0,
+                source_tx_rtt_us: 0,
+                recv_seq: 0,
+                conn_epoch_us: 0,
+                commitment: Commitment::Finalized,
+                slot,
+                block_height: slot - 22_000_000,
+                blockhash: "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn".to_string(),
+                tx_index,
+                signature: signature.to_string(),
+                version: TransactionVersion::V0,
+                success: true,
+                fee_lamports: 5_000,
+                compute_units_consumed: None,
+                compute_unit_limit: None,
+                compute_unit_price_micro_lamports: None,
+                priority_fee_lamports: None,
+                cost_units: None,
+                signers: Vec::new(),
+                account_keys: Vec::new(),
+                log_messages: None,
+                failure: None,
+            })
+            .collect()
+    }
+
+    const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+
+    fn validate_transactions(
+        rows: &[aetelier_types::onchain::Transaction],
+    ) -> FileReport {
+        let dir = tempfile::tempdir().unwrap();
+        let path = aetelier_io::onchain::write_transactions_parquet_timestamped(
+            rows,
+            dir.path(),
+            "sync",
+        )
+        .unwrap();
+        let size_bytes = fs::metadata(&path).unwrap().len();
+        let cli = Cli::parse_from([
+            "validate",
+            "--flush-threshold",
+            "60",
+            "--grid-period-us",
+            "1000000",
+        ]);
+        validate_file(&path, "solana", DataKind::Transactions, size_bytes, &cli).unwrap()
+    }
+
+    #[test]
+    fn transactions_writer_output_passes_every_file_check() {
+        let rows = transactions(
+            JUPITER_V6,
+            &[
+                (380_000_000, 1, "a"),
+                (380_000_000, 4, "b"),
+                (380_000_003, 0, "c"),
+            ],
+        );
+        let report = validate_transactions(&rows);
+        assert_eq!(report.failed, Vec::<&str>::new());
+        assert_eq!((report.symbol.as_str(), report.row_count), (JUPITER_V6, 3));
+    }
+
+    #[test]
+    fn duplicate_and_reordered_transactions_fail_t11_and_t12() {
+        let rows =
+            transactions(JUPITER_V6, &[(380_000_001, 2, "a"), (380_000_001, 2, "a")]);
+        let report = validate_transactions(&rows);
+        assert!(
+            report
+                .failed
+                .contains(&TestId::UniqueTransactionKeys.code())
+        );
+        assert!(
+            report
+                .failed
+                .contains(&TestId::OrderedTransactionPositions.code())
+        );
+        assert!(
+            !report
+                .failed
+                .contains(&TestId::TransactionBlockContext.code())
+        );
+    }
+
+    #[test]
+    fn missing_block_context_fails_t13() {
+        let mut rows = transactions(JUPITER_V6, &[(380_000_000, 1, "a")]);
+        rows[0].blockhash.clear();
+        let report = validate_transactions(&rows);
+        assert_eq!(report.failed, vec![TestId::TransactionBlockContext.code()]);
+    }
+
+    #[test]
+    fn convention_transactions_keep_the_case_sensitive_address() {
+        let p = PathBuf::from(format!(
+            "/data/solana/transactions/solana_{JUPITER_V6}_txs_sync_20261109_141107.000000.parquet"
+        ));
+        assert!(matches_convention(&p, DataKind::Transactions));
+        assert!(!matches_convention(&p, DataKind::Trades));
+        assert_eq!(parse_symbol_from_filename(&p).as_deref(), Some(JUPITER_V6));
+    }
+
+    #[test]
+    fn files_present_expectations_follow_the_venue() {
+        assert_eq!(DataKind::expected_for("solana"), &[DataKind::Transactions]);
+        assert_eq!(
+            DataKind::expected_for("binance"),
+            &[DataKind::Orderbook, DataKind::Trades]
+        );
     }
 }

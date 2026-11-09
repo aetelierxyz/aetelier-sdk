@@ -496,6 +496,7 @@ mod tests {
             liquidations: FeedToggle { enabled: true },
             funding_rates: FeedToggle { enabled: false },
             open_interest: FeedToggle { enabled: false },
+            transactions: Default::default(),
         }
     }
 

@@ -158,6 +158,7 @@ fn test_aggregate_orderbook_mid_price() {
         funding_rate: vec![],
         open_interest: vec![],
         funding_settlements: vec![],
+        transactions: Vec::new(),
     };
 
     let agg = MarketAggregate::from_snapshot(&snap, 0.0);
@@ -182,6 +183,7 @@ fn test_aggregate_orderbook_imbalance() {
         funding_rate: vec![],
         open_interest: vec![],
         funding_settlements: vec![],
+        transactions: Vec::new(),
     };
 
     let agg = MarketAggregate::from_snapshot(&snap, 0.0);
@@ -209,6 +211,7 @@ fn test_aggregate_trade_vwap() {
         funding_rate: vec![],
         open_interest: vec![],
         funding_settlements: vec![],
+        transactions: Vec::new(),
     };
 
     let agg = MarketAggregate::from_snapshot(&snap, 0.0);
@@ -238,6 +241,7 @@ fn test_aggregate_liquidation_imbalance() {
         funding_rate: vec![],
         open_interest: vec![],
         funding_settlements: vec![],
+        transactions: Vec::new(),
     };
 
     let agg = MarketAggregate::from_snapshot(&snap, 0.0);
@@ -261,6 +265,7 @@ fn test_aggregate_funding_rate() {
         funding_rate: vec![make_funding(1000, 0.0001, 29_800_000)],
         open_interest: vec![],
         funding_settlements: vec![],
+        transactions: Vec::new(),
     };
 
     let agg = MarketAggregate::from_snapshot(&snap, 0.0);
@@ -283,6 +288,7 @@ fn test_aggregate_oi_change() {
         funding_rate: vec![],
         open_interest: vec![make_oi(1000, 5000.0, 250_000_000.0)],
         funding_settlements: vec![],
+        transactions: Vec::new(),
     };
 
     // First snapshot: prev_oi=0.0, change = 5000 - 0 = 5000
@@ -300,6 +306,7 @@ fn test_aggregate_oi_change() {
         funding_rate: vec![],
         open_interest: vec![make_oi(2000, 5200.0, 260_000_000.0)],
         funding_settlements: vec![],
+        transactions: Vec::new(),
     };
     let agg2 = MarketAggregate::from_snapshot(&snap2, agg1.oi_contracts);
     assert!((agg2.oi_change - 200.0).abs() < f64::EPSILON);

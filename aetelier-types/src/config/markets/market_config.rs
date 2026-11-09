@@ -53,6 +53,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use crate::errors::ConfigError;
+use crate::onchain::MatchRole;
 use crate::synchronizers::ClockMode;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +169,8 @@ pub struct DataTypesSection {
     /// Open interest updates feed.
     #[serde(default)]
     pub open_interest: FeedToggle,
+    #[serde(default)]
+    pub transactions: TransactionsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -177,15 +180,17 @@ pub enum DeclaredDatatype {
     Liquidations,
     FundingRates,
     OpenInterest,
+    Transactions,
 }
 
 impl DeclaredDatatype {
-    pub const ALL: [DeclaredDatatype; 5] = [
+    pub const ALL: [DeclaredDatatype; 6] = [
         DeclaredDatatype::Orderbook,
         DeclaredDatatype::Trades,
         DeclaredDatatype::Liquidations,
         DeclaredDatatype::FundingRates,
         DeclaredDatatype::OpenInterest,
+        DeclaredDatatype::Transactions,
     ];
 
     pub fn id(&self) -> &'static str {
@@ -195,6 +200,7 @@ impl DeclaredDatatype {
             DeclaredDatatype::Liquidations => "liquidations",
             DeclaredDatatype::FundingRates => "funding_rates",
             DeclaredDatatype::OpenInterest => "open_interest",
+            DeclaredDatatype::Transactions => "transactions",
         }
     }
 }
@@ -214,6 +220,7 @@ impl DeclaredSet {
                 DeclaredDatatype::Liquidations => section.liquidations.enabled,
                 DeclaredDatatype::FundingRates => section.funding_rates.enabled,
                 DeclaredDatatype::OpenInterest => section.open_interest.enabled,
+                DeclaredDatatype::Transactions => section.transactions.enabled,
             };
             if on {
                 enabled.insert(dt);
@@ -267,7 +274,7 @@ impl DataTypesSection {
     /// Return the names of all enabled feeds as lowercase strings.
     ///
     /// The order is deterministic: orderbook, trades, liquidations,
-    /// funding_rates, open_interest.
+    /// funding_rates, open_interest, transactions.
     pub fn enabled_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         if self.orderbook.enabled {
@@ -284,6 +291,9 @@ impl DataTypesSection {
         }
         if self.open_interest.enabled {
             names.push("open_interest".into());
+        }
+        if self.transactions.enabled {
+            names.push("transactions".into());
         }
         names
     }
@@ -321,6 +331,33 @@ pub struct FeedToggle {
     /// Whether this feed is enabled.
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TransactionsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, rename = "match")]
+    pub match_role: MatchRole,
+    #[serde(default = "default_include_failed")]
+    pub include_failed: bool,
+    #[serde(default)]
+    pub logs: bool,
+}
+
+impl Default for TransactionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            match_role: MatchRole::default(),
+            include_failed: default_include_failed(),
+            logs: false,
+        }
+    }
+}
+
+fn default_include_failed() -> bool {
+    true
 }
 
 /// `[logs]` — per-event-type print frequency thresholds.

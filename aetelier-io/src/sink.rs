@@ -13,7 +13,7 @@ use aetelier_types::snapshots::MarketSnapshot;
 /// Flushes [`MarketSnapshot`] batches to per-datatype Parquet files.
 ///
 /// Decomposes snapshots into orderbooks, trades, liquidations, funding
-/// rates, open interest, and funding settlements, then writes each to a
+/// rates, open interest, funding settlements, and transactions, then writes each to a
 /// timestamped Parquet file in a subdirectory of the configured output
 /// path. Every file lands through the atomic finalize path (staged write,
 /// fsync, rename, directory fsync) and is recorded in that leaf's
@@ -86,6 +86,10 @@ where
 {
     let leaf = leaf_dir_for(output_path, datatype, t_min_us);
     std::fs::create_dir_all(&leaf)?;
+    let guard = crate::leaf_index::leaf_write_guard(&leaf);
+    let _serialized = guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     crate::leaf_index::acquire_leaf_lock(&leaf)?;
     crate::leaf_index::sweep_staging(&leaf);
     let staging = leaf.join(crate::leaf_index::STAGING_DIR);
@@ -135,6 +139,7 @@ impl SnapshotFlusher for ParquetSnapshotFlusher {
             funding_rates,
             open_interests,
             funding_settlements,
+            transactions,
         } = crate::snapshots::decompose_snapshots(snapshots);
 
         let output_path = std::path::Path::new(output_dir);
@@ -236,6 +241,23 @@ impl SnapshotFlusher for ParquetSnapshotFlusher {
                 |staging| {
                     crate::funding::write_funding_settlement_parquet_timestamped(
                         &funding_settlements,
+                        staging,
+                        "sync",
+                    )
+                },
+            )?;
+            total_files += 1;
+        }
+        if !transactions.is_empty() {
+            total_bytes += persist_leaf(
+                output_path,
+                "transactions",
+                transactions.len() as u64,
+                t_min_us,
+                t_max_us,
+                |staging| {
+                    crate::onchain::write_transactions_parquet_timestamped(
+                        &transactions,
                         staging,
                         "sync",
                     )

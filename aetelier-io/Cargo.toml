@@ -60,6 +60,11 @@ path = "tests/types/open_interest/test_oi_parquet_roundtrip.rs"
 required-features = ["parquet"]
 
 [[test]]
+name = "test_transactions_parquet_roundtrip"
+path = "tests/types/onchain/test_transactions_parquet_roundtrip.rs"
+required-features = ["parquet"]
+
+[[test]]
 name = "test_flusher_atomicity"
 path = "tests/sink/test_flusher_atomicity.rs"
 required-features = ["connect", "parquet"]

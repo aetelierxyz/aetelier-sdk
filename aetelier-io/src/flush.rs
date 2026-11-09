@@ -48,6 +48,7 @@ impl FlushToParquet for MarketSynchronizer {
             funding_rates,
             open_interests,
             funding_settlements,
+            transactions,
         } = crate::snapshots::decompose_snapshots(snapshots);
 
         let mut result = FlushResult {
@@ -121,6 +122,17 @@ impl FlushToParquet for MarketSynchronizer {
                 "sync",
             )?;
             result.funding_settlement_path = Some(path);
+        }
+
+        if !transactions.is_empty() {
+            let tx_dir = output_dir.join(crate::onchain::DATATYPE_DIR);
+            std::fs::create_dir_all(&tx_dir)?;
+            let path = crate::onchain::write_transactions_parquet_timestamped(
+                &transactions,
+                &tx_dir,
+                "sync",
+            )?;
+            result.transactions_path = Some(path);
         }
 
         // Every source wrote — safe to release the buffer now.

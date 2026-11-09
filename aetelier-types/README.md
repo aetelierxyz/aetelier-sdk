@@ -29,6 +29,7 @@ assert_eq!(trade.pair.to_canonical(), "BTC/USDT");
 - `trades` — `Trade`, `TradeSide`, `TradeOrigin` (ws | rest provenance), builder.
 - `orderbooks` — `Orderbook` (BTreeMap levels, best bid/ask/mid accessors), `Level`, decimal conversion helpers.
 - `liquidations`, `funding`, `open_interest` — the extended datatypes.
+- `onchain` — `ChainAddress` (case-preserving base58, 32 bytes), `Instrument`, and the `Transaction` record.
 - `trading_pair` — canonical `BASE/QUOTE` pairs with venue codec support.
 - `config` — worker and market manifests (TOML-backed).
 - `errors` — the typed error taxonomy shared by builders and IO.

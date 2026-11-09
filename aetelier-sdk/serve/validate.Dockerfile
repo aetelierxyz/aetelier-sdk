@@ -22,7 +22,7 @@
 # * `/data` is mounted read-only — the validator never mutates the lake.
 # * `/state` is read-write and holds `validate_state.json` (cumulative)
 #   plus `last_report.json` (per-run snapshot).
-# * Exit code 0 = all 10 tests passed, 1 = at least one failed,
+# * Exit code 0 = all 13 tests passed, 1 = at least one failed,
 #   2 = fatal error (state file unreadable, etc.). Wire this directly
 #   into a cron-driven monitor or alertmanager probe.
 

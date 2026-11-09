@@ -394,6 +394,7 @@ impl MarketSynchronizer {
                 funding_rate: bundle.funding,
                 open_interest: bundle.open_interest,
                 funding_settlements: bundle.funding_settlements,
+                transactions: Vec::new(),
             };
             self.buffer.push(snap);
         }
@@ -522,6 +523,7 @@ impl MarketSynchronizer {
                 funding_rate: bundle.funding,
                 open_interest: bundle.open_interest,
                 funding_settlements: bundle.funding_settlements,
+                transactions: Vec::new(),
             };
             self.buffer.push(snap);
         }
@@ -660,6 +662,7 @@ impl MarketSynchronizer {
                 funding_rate: funding_rates.clone(),
                 open_interest: open_interests.clone(),
                 funding_settlements: settlements.clone(),
+                transactions: Vec::new(),
             };
 
             self.buffer.push(snap);
@@ -693,6 +696,7 @@ impl MarketSynchronizer {
             funding_rate: funding_rates,
             open_interest: open_interests,
             funding_settlements: settlements,
+            transactions: Vec::new(),
         };
 
         self.buffer.push(snap);

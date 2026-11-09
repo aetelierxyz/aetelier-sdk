@@ -21,6 +21,7 @@ pub enum FileKind {
     FundingSettlement,
     /// `oi`
     OpenInterest,
+    Transactions,
 }
 
 impl FileKind {
@@ -30,6 +31,7 @@ impl FileKind {
         FileKind::Liquidations,
         FileKind::Funding,
         FileKind::Trades,
+        FileKind::Transactions,
         FileKind::Orderbook,
         FileKind::OpenInterest,
     ];
@@ -43,6 +45,7 @@ impl FileKind {
             FileKind::Funding => "funding",
             FileKind::FundingSettlement => "funding_settlement",
             FileKind::OpenInterest => "oi",
+            FileKind::Transactions => "txs",
         }
     }
 }

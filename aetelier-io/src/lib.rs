@@ -56,6 +56,8 @@ pub mod open_interest;
 /// Snapshot aggregate I/O (Parquet)
 pub mod snapshots;
 
+pub mod onchain;
+
 /// FlushToParquet extension trait (requires `connect` + `parquet` features)
 #[cfg(all(feature = "connect", feature = "parquet"))]
 pub mod flush;

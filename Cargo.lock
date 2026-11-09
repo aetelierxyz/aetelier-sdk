@@ -129,6 +129,7 @@ dependencies = [
 name = "aetelier-types"
 version = "0.1.1"
 dependencies = [
+ "bs58",
  "chrono",
  "getrandom 0.3.4",
  "js-sys",
@@ -628,6 +629,15 @@ checksum = "34c6783f42c21c952ad7112b354f0ba2f10760e9decea5b1b60523d6e270faaf"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
+]
+
+[[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]

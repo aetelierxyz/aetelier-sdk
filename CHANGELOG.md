@@ -8,6 +8,16 @@ entry is edited only to correct a factual error, never to restate its scope.
 
 ### Promotions
 
+### Added
+
+- `aetelier_types::onchain`: `Chain`, `ChainAddress` (case-preserving base58, validated to 32 bytes), `Instrument`, and the `Transaction` record with `MatchRole`, `Commitment`, `TransactionVersion` (`legacy`, `v0`, `v1`) and `TransactionFailure`. `DeclaredDatatype::Transactions`, the `[datatypes.transactions]` feed (`enabled`, `match`, `include_failed`, `logs`) and `MarketSnapshot.transactions`.
+- `aetelier_io::onchain`: the `transactions.v1` Parquet writer and reader (file tag `txs`, leaf `transactions`), its schema fingerprint, and `check_transactions`.
+- `validate` T11–T13: unique `(address, signature)` per file, `(slot, tx_index)` order per address, block context and row invariants. T01 expects `transactions` for `solana` and `orderbooks` + `trades` elsewhere.
+
+### Fixed
+
+- Workers flushing into the same leaf in one process could delete each other's staged Parquet file in the `.staging` sweep, failing the flush with `ENOENT` and forcing a retry. Flushes into one leaf are now serialized in-process.
+
 ## v0.1.1 — 2026-10-06
 
 ### Promotions

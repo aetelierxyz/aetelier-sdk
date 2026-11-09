@@ -40,6 +40,8 @@ pub mod orders;
 /// Multi-source market snapshot aggregation
 pub mod snapshots;
 
+pub mod onchain;
+
 /// Synchronization and clock modes
 pub mod synchronizers;
 
@@ -62,6 +64,8 @@ pub mod subscriptions;
 /// Canonical trading pair representation
 pub mod trading_pair;
 
+pub mod instrument;
+
 /// General utilities
 pub mod utils;
 
@@ -81,6 +85,7 @@ pub use exchanges::Exchange;
 pub use exchanges::MarketType;
 /// Re-export of FundingRate type.
 pub use funding::FundingRate;
+pub use instrument::Instrument;
 /// Re-export of Level type.
 pub use levels::Level;
 /// Re-export of Liquidation type.

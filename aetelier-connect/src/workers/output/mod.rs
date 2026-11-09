@@ -723,6 +723,12 @@ impl BufferedSink {
                         out.open_interest.clear();
                     }
                 }
+                DD::Transactions => {
+                    if !out.transactions.is_empty() {
+                        stripped += out.transactions.len() as u64;
+                        out.transactions.clear();
+                    }
+                }
             }
         }
         if stripped > 0 {
@@ -1159,6 +1165,7 @@ mod tests {
             funding_rate: vec![],
             open_interest: vec![],
             funding_settlements: vec![],
+            transactions: Vec::new(),
         }
     }
 
@@ -1463,6 +1470,7 @@ mod tests {
             liquidations: FeedToggle { enabled: false },
             funding_rates: FeedToggle { enabled: false },
             open_interest: FeedToggle { enabled: false },
+            transactions: Default::default(),
         }
     }
 

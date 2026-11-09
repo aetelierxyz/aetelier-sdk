@@ -2,7 +2,7 @@
 //!
 //! Each canonical datatype's REAL parquet writer produces a sample file; the
 //! footer's parquet schema is canonicalized through the parquet schema
-//! printer and sha256-hashed. The six fingerprints must equal the committed
+//! printer and sha256-hashed. The seven fingerprints must equal the committed
 //! artifact `aetelier-io/schemas.fingerprints.json`. A writer layout change —
 //! including a positional append — changes the fingerprint and fails here
 //! until a new schema_id version is minted.
@@ -15,6 +15,9 @@ mod fingerprints {
     use aetelier_types::TradeSide;
     use aetelier_types::funding::{FundingRate, FundingSettlement};
     use aetelier_types::liquidations::Liquidation;
+    use aetelier_types::onchain::{
+        ChainAddress, Commitment, MatchRole, Transaction, TransactionVersion,
+    };
     use aetelier_types::open_interest::OpenInterest;
     use aetelier_types::orderbooks::delta::NormalizedDelta;
     use aetelier_types::orderbooks::{Orderbook, OrderbookDelta, f64_to_decimal};
@@ -133,6 +136,38 @@ mod fingerprints {
         }
     }
 
+    fn sample_transaction() -> Transaction {
+        Transaction {
+            exchange: "solana".to_string(),
+            address: ChainAddress::solana("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")
+                .unwrap(),
+            match_role: MatchRole::AccountKey,
+            source_tx_ts_us: 1_672_304_484_000_000,
+            local_tx_ts_us: 1_672_304_484_400_000,
+            source_tx_rtt_us: 0,
+            recv_seq: 1,
+            conn_epoch_us: 1,
+            commitment: Commitment::Finalized,
+            slot: 170_000_000,
+            block_height: 155_000_000,
+            blockhash: "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn".to_string(),
+            tx_index: 3,
+            signature: "fp-signature".to_string(),
+            version: TransactionVersion::V0,
+            success: true,
+            fee_lamports: 5_000,
+            compute_units_consumed: Some(1_000),
+            compute_unit_limit: None,
+            compute_unit_price_micro_lamports: None,
+            priority_fee_lamports: None,
+            cost_units: None,
+            signers: vec!["11111111111111111111111111111111".to_string()],
+            account_keys: vec!["11111111111111111111111111111111".to_string()],
+            log_messages: None,
+            failure: None,
+        }
+    }
+
     fn computed_fingerprints() -> BTreeMap<String, String> {
         let dir = tempdir().unwrap();
         let mut out = BTreeMap::new();
@@ -184,6 +219,14 @@ mod fingerprints {
         )
         .unwrap();
         out.insert("funding_settlements".to_string(), fingerprint_of(&p));
+
+        let p = aetelier_io::onchain::write_transactions_parquet_timestamped(
+            &[sample_transaction()],
+            dir.path(),
+            "sync",
+        )
+        .unwrap();
+        out.insert("transactions".to_string(), fingerprint_of(&p));
 
         out
     }
@@ -290,6 +333,17 @@ mod fingerprints {
                 1_672_304_484_000_000,
                 aetelier_io::funding::write_funding_settlement_parquet_timestamped(
                     &[hip3_settlement],
+                    dir.path(),
+                    "sync",
+                ),
+            ),
+            (
+                FileKind::Transactions,
+                "solana",
+                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                1_672_304_484_000_000,
+                aetelier_io::onchain::write_transactions_parquet_timestamped(
+                    &[sample_transaction()],
                     dir.path(),
                     "sync",
                 ),

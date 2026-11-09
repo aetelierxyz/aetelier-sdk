@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aetelier_types::errors::PersistError;
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,15 @@ fn held_locks() -> &'static Mutex<HashMap<PathBuf, File>> {
     HELD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub fn leaf_write_guard(leaf: &Path) -> Arc<Mutex<()>> {
+    static GUARDS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut guards = GUARDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(guards.entry(leaf.to_path_buf()).or_default())
+}
+
 fn try_exclusive_flock(file: &File) -> std::io::Result<bool> {
     use fs4::fs_std::FileExt;
     file.try_lock_exclusive()
@@ -94,8 +103,9 @@ pub fn acquire_leaf_lock(leaf: &Path) -> Result<(), PersistError> {
 }
 
 /// Removes leftovers a crashed flush stranded in `.staging`, warning with
-/// the count. Safe on every flush: staging is exclusively this process's
-/// (the leaf lock is already held) and is emptied by each finalize.
+/// the count. Safe on every flush only while the caller holds both the
+/// process leaf lock and [`leaf_write_guard`] for this leaf, so no other
+/// flush in this process has a staged file in flight.
 pub fn sweep_staging(leaf: &Path) {
     let staging = leaf.join(STAGING_DIR);
     let Ok(entries) = fs::read_dir(&staging) else {

@@ -34,6 +34,7 @@ mod tests {
             liquidations: FeedToggle { enabled: true },
             funding_rates: FeedToggle { enabled: true },
             open_interest: FeedToggle { enabled: true },
+            transactions: Default::default(),
         }
     }
 
