@@ -28,6 +28,8 @@ pub const ENFORCED: &[&str] = &[
     "DAT-SK-T-16",   // gap incident appended to the JSONL gap ledger
     "DAT-RC-INV-2",  // reconcile fetches are incident/sweep-bounded
     "DAT-RC-INV-4",  // recovery counters never rewrite loss accounting
+    "DAT-F-T-3",
+    "DAT-F-INV-4",
 ];
 
 /// `SourceMetrics` snapshot field -> the invariant id(s) that counter

@@ -25,6 +25,7 @@ pub enum GapCause {
     Resync,
     /// The venue socket dropped (transport failure / server close).
     Disconnect,
+    SlotGap,
 }
 
 /// One closed coverage incident.
@@ -46,6 +47,16 @@ pub struct GapIncident {
     /// sequence). Exact-armed sources count outages via the sequence carry
     /// instead, so this stays `None` there.
     pub possible_dropped_trades: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks_lost: Option<u64>,
 }
 
 /// The sentinel's possible-loss estimator: prints possibly dropped during a
@@ -154,6 +165,11 @@ mod tests {
             exchange: "bitso".into(),
             symbol: "btc_mxn".into(),
             possible_dropped_trades: Some(2),
+            prev_slot: None,
+            prev_height: None,
+            next_slot: None,
+            next_height: None,
+            blocks_lost: None,
         }
     }
 
@@ -216,6 +232,95 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .contains("BTC-USD")
+        );
+    }
+
+    #[test]
+    fn a_cex_incident_line_is_byte_identical() {
+        let line = serde_json::to_string(&incident(
+            1_700_000_000_000_000,
+            1_700_000_001_000_000,
+            GapCause::Resync,
+        ))
+        .unwrap();
+        assert_eq!(
+            line,
+            r#"{"opened_epoch_us":1700000000000000,"closed_epoch_us":1700000001000000,"window_us":1000000,"cause":"resync","exchange":"bitso","symbol":"btc_mxn","possible_dropped_trades":2}"#
+        );
+        let mut exact = incident(10, 25, GapCause::Disconnect);
+        exact.possible_dropped_trades = None;
+        assert_eq!(
+            serde_json::to_string(&exact).unwrap(),
+            r#"{"opened_epoch_us":10,"closed_epoch_us":25,"window_us":15,"cause":"disconnect","exchange":"bitso","symbol":"btc_mxn","possible_dropped_trades":null}"#
+        );
+    }
+
+    #[test]
+    fn a_line_written_before_slot_bounds_reads_back_without_them() {
+        let row: GapIncident = serde_json::from_str(
+            r#"{"opened_epoch_us":10,"closed_epoch_us":25,"window_us":15,"cause":"disconnect","exchange":"bybit","symbol":"BTCUSDT","possible_dropped_trades":null}"#,
+        )
+        .unwrap();
+        assert_eq!(row.cause, GapCause::Disconnect);
+        assert_eq!(row.possible_dropped_trades, None);
+        assert_eq!(
+            (
+                row.prev_slot,
+                row.prev_height,
+                row.next_slot,
+                row.next_height,
+                row.blocks_lost
+            ),
+            (None, None, None, None, None)
+        );
+    }
+
+    #[test]
+    fn slot_gap_cause_serializes_as_slot_gap() {
+        assert_eq!(
+            serde_json::to_string(&GapCause::SlotGap).unwrap(),
+            r#""slot_gap""#
+        );
+        assert_eq!(
+            serde_json::from_str::<GapCause>(r#""slot_gap""#).unwrap(),
+            GapCause::SlotGap
+        );
+        let gap = GapIncident {
+            opened_epoch_us: 1_791_321_067_000_000,
+            closed_epoch_us: 1_791_321_070_200_000,
+            window_us: 3_200_000,
+            cause: GapCause::SlotGap,
+            exchange: "solana".into(),
+            symbol: "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".into(),
+            possible_dropped_trades: None,
+            prev_slot: Some(380_000_001),
+            prev_height: Some(358_000_001),
+            next_slot: Some(380_000_009),
+            next_height: Some(358_000_006),
+            blocks_lost: Some(4),
+        };
+        let line = serde_json::to_string(&gap).unwrap();
+        assert_eq!(
+            line,
+            r#"{"opened_epoch_us":1791321067000000,"closed_epoch_us":1791321070200000,"window_us":3200000,"cause":"slot_gap","exchange":"solana","symbol":"JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4","possible_dropped_trades":null,"prev_slot":380000001,"prev_height":358000001,"next_slot":380000009,"next_height":358000006,"blocks_lost":4}"#
+        );
+        let back: GapIncident = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.cause, GapCause::SlotGap);
+        assert_eq!(
+            (back.prev_slot, back.next_height, back.blocks_lost),
+            (Some(380_000_001), Some(358_000_006), Some(4))
+        );
+    }
+
+    #[test]
+    fn an_address_symbol_keeps_its_case_in_the_legacy_ledger_name() {
+        let address = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+        let ledger = GapLedger::new(Path::new("/out"), "solana", address);
+        assert_eq!(
+            ledger.path(),
+            Path::new(
+                "/out/gaps/solana_JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4_gap_ledger.jsonl"
+            )
         );
     }
 }

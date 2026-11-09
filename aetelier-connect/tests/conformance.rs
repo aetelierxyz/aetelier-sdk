@@ -293,6 +293,10 @@ macro_rules! conformance_suite {
             fn derivative_invariants() {
                 harness::assert_kind(&$desc, kind("derivative_invariants"));
             }
+            #[test]
+            fn feed_lifecycle() {
+                harness::assert_kind(&$desc, kind("feed_lifecycle"));
+            }
         }
     };
 }
@@ -341,22 +345,28 @@ fn conformance_matrix() {
     for k in kinds::KINDS {
         println!("  {:<24} -> {}", k.name, k.atlas);
     }
+    let mut certified = std::collections::HashSet::new();
     for desc in WIRED {
+        let outcomes: Vec<harness::Outcome> =
+            kinds::KINDS.iter().map(|k| (k.run)(desc)).collect();
         let mut row = Vec::new();
-        for k in kinds::KINDS {
-            let cell = match (k.run)(desc) {
+        for (k, outcome) in kinds::KINDS.iter().zip(&outcomes) {
+            let cell = match outcome {
                 harness::Outcome::Pass => "PASS",
                 harness::Outcome::NotApplicable(_) => "n/a",
                 harness::Outcome::Skip(_) => "skip",
                 harness::Outcome::Fail(_) => "FAIL",
             };
+            if matches!(outcome, harness::Outcome::Pass) {
+                certified.insert(k.name);
+            }
             row.push(format!("{}={}", k.name, cell));
         }
         println!("{:<10} done={} | {}", desc.venue, desc.done, row.join("  "));
 
         if desc.done {
-            for k in kinds::KINDS {
-                match (k.run)(desc) {
+            for (k, outcome) in kinds::KINDS.iter().zip(&outcomes) {
+                match outcome {
                     // Pass and NotApplicable are both green for a DONE venue;
                     // NotApplicable is a by-design non-gap, not a coverage hole.
                     harness::Outcome::Pass | harness::Outcome::NotApplicable(_) => {}
@@ -369,4 +379,12 @@ fn conformance_matrix() {
         }
     }
     println!("=====================================\n");
+    for k in kinds::KINDS.iter().filter(|k| !k.invariants.is_empty()) {
+        assert!(
+            certified.contains(k.name),
+            "kind {} certifies {:?} but passes on no wired venue",
+            k.name,
+            k.invariants
+        );
+    }
 }

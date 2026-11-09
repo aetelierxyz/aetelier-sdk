@@ -28,11 +28,13 @@ use crate::clients::reconnect::{ReconnectAction, ReconnectPolicy};
 use crate::framework::budget::SourceMetrics;
 use crate::framework::registry::TaskExit;
 use crate::framework::runtime::{ReconstructedEvent, RuntimeOutcome, SourceRuntime};
+use crate::framework::symbol::SymbolCodec;
 
 use crate::config::workers::{MarketWorkerConfig, OutputSinkConfig};
 use crate::errors::ConnectError;
 use crate::sources::ExchangeEvent;
 use crate::synchronizers::{ClockMode, MarketSynchronizer};
+use aetelier_types::Instrument;
 use aetelier_types::exchanges::Exchange;
 use aetelier_types::levels::Level;
 use aetelier_types::orders::OrderSide;
@@ -881,13 +883,11 @@ impl MarketWorker {
             anyhow::bail!(e);
         }
 
-        let pair = adapter
-            .profile()
-            .symbol_codec
-            .decode(&symbol)
-            .ok_or_else(|| {
-                anyhow::anyhow!("cannot decode symbol {symbol} for {exchange_name}")
-            })?;
+        let instrument = framework_instrument(
+            &adapter.profile().symbol_codec,
+            &exchange_name,
+            &symbol,
+        )?;
         let model = adapter.book_model("orders");
         // The adapter is the single source of truth for the seeding
         // taxonomy: SnapshotSource drives needs_rest and the recovery
@@ -906,17 +906,12 @@ impl MarketWorker {
         // One Feed per (instrument, datatype) this worker subscribes; owned
         // here so FeedIds survive socket reconnects. Liquidations remain on
         // the legacy path and enter the feed taxonomy when ported.
-        let feeds = {
-            use crate::framework::feed::{Feed, FeedDatatype, FeedSet};
-            let list: Vec<Feed> = core
-                .datatypes()
-                .declared_set()
-                .iter()
-                .filter_map(FeedDatatype::for_declared)
-                .map(|dt| Feed::new(exchange_enum, pair.clone(), dt))
-                .collect();
-            FeedSet::new(list).into_shared()
-        };
+        let feeds = crate::framework::feed::FeedSet::for_declared(
+            exchange_enum,
+            &instrument,
+            &core.datatypes().declared_set(),
+        )
+        .into_shared();
         let (initial_market_type, initial_sinks) = status_tx
             .as_ref()
             .map(|tx| {
@@ -1005,7 +1000,9 @@ impl MarketWorker {
         let (trigger_tx, mut trigger_rx) = mpsc::channel::<()>(4);
         let mut recent_ids: std::collections::VecDeque<u64> =
             std::collections::VecDeque::new();
-        if let Some((rcfg, fetcher)) = &reconciler {
+        if let Some((rcfg, fetcher)) = &reconciler
+            && let Some(pair) = instrument.as_pair()
+        {
             let fetcher = fetcher.clone();
             let last_pos = last_pos.clone();
             let metrics_c = metrics.clone();
@@ -1219,6 +1216,11 @@ impl MarketWorker {
                                                 exchange: exchange_name.clone(),
                                                 symbol: symbol.clone(),
                                                 possible_dropped_trades: estimate,
+                                                prev_slot: None,
+                                                prev_height: None,
+                                                next_slot: None,
+                                                next_height: None,
+                                                blocks_lost: None,
                                             };
                                         if let Err(e) = ledger.append(&incident) {
                                             metrics.bump_flush_failures();
@@ -1400,7 +1402,7 @@ impl MarketWorker {
                             let _ = tx.send(WorkerStatus {
                                 id: id_str,
                                 exchange: exchange_enum,
-                                pair: pair.clone().into(),
+                                pair: instrument.clone(),
                                 market_type: initial_market_type,
                                 mode: WorkerMode::Clock {
                                     clock: clock_mode,
@@ -1543,6 +1545,11 @@ impl MarketWorker {
                     exchange: exchange_name.clone(),
                     symbol: symbol.clone(),
                     possible_dropped_trades: None,
+                    prev_slot: None,
+                    prev_height: None,
+                    next_slot: None,
+                    next_height: None,
+                    blocks_lost: None,
                 };
                 if let Err(e) = ledger.append(&incident) {
                     metrics.bump_flush_failures();
@@ -1570,7 +1577,7 @@ impl MarketWorker {
             let _ = tx.send(WorkerStatus {
                 id: id_str,
                 exchange: exchange_enum,
-                pair: pair.clone().into(),
+                pair: instrument.clone(),
                 market_type: initial_market_type,
                 mode: WorkerMode::Clock {
                     clock: clock_mode,
@@ -1665,6 +1672,16 @@ fn maybe_flush(
         *flushes += 1;
     }
     Ok(())
+}
+
+fn framework_instrument(
+    codec: &SymbolCodec,
+    exchange_name: &str,
+    symbol: &str,
+) -> anyhow::Result<Instrument> {
+    codec.decode_instrument(symbol).ok_or_else(|| {
+        anyhow::anyhow!("cannot decode symbol {symbol} for {exchange_name}")
+    })
 }
 
 /// Receive the next command, or pend forever when no receiver is attached.
@@ -2743,5 +2760,65 @@ symbol = "{JUPITER_V6}"
             .filter_map(|snap| snap.orderbook.as_ref().map(|ob| ob.orderbook_ts_us))
             .collect();
         assert_eq!(books.first(), Some(&1_791_321_096_929_000));
+    }
+
+    #[test]
+    fn framework_instrument_decodes_every_registered_cex_wire_symbol() {
+        use crate::framework::registry::registry;
+        let cases = [
+            ("binance", "BTCUSDT", "BTC/USDT"),
+            ("okx", "BTC-USDT", "BTC/USDT"),
+            ("kraken", "BTC/USD", "BTC/USD"),
+            ("coinbase", "BTC-USD", "BTC/USD"),
+            ("bybit", "BTCUSDT", "BTC/USDT"),
+            ("gateio", "BTC_USDT", "BTC/USDT"),
+            ("bitget", "BTCUSDT", "BTC/USDT"),
+            ("poloniex", "BTC_USDT", "BTC/USDT"),
+            ("upbit", "KRW-BTC", "BTC/KRW"),
+            ("htx", "btcusdt", "BTC/USDT"),
+            ("bitso", "btc_mxn", "BTC/MXN"),
+            ("kucoin", "BTC-USDT", "BTC/USDT"),
+            ("hyperliquid", "BTC", "BTC/USDC"),
+        ];
+        for (id, adapter) in registry() {
+            let exchange: Exchange = id.parse().unwrap();
+            if exchange.chain().is_some() {
+                continue;
+            }
+            let (_, symbol, canonical) = cases
+                .iter()
+                .find(|(venue, ..)| venue == id)
+                .unwrap_or_else(|| panic!("no wire symbol listed for {id}"));
+            let codec = &adapter.profile().symbol_codec;
+            let instrument = framework_instrument(codec, id, symbol).unwrap();
+            assert_eq!(instrument.canonical(), *canonical, "{id}");
+            assert_eq!(instrument.as_pair(), codec.decode(symbol).as_ref(), "{id}");
+        }
+        for (venue, ..) in cases {
+            assert!(registry().contains_key(venue), "{venue} is not registered");
+        }
+    }
+
+    #[test]
+    fn undecodable_symbol_names_the_symbol_and_venue() {
+        use crate::framework::registry::registry;
+        let coinbase = &registry().get("coinbase").unwrap().profile().symbol_codec;
+        let err = framework_instrument(coinbase, "coinbase", "BTCUSD").unwrap_err();
+        assert_eq!(err.to_string(), "cannot decode symbol BTCUSD for coinbase");
+
+        let chain = SymbolCodec::ChainAddress {
+            chain: aetelier_types::onchain::Chain::Solana,
+        };
+        let folded = JUPITER_V6.to_lowercase();
+        for symbol in [folded.as_str(), "BTCUSDT", "BTC/USDT"] {
+            let err = framework_instrument(&chain, "solana", symbol).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("cannot decode symbol {symbol} for solana")
+            );
+        }
+        let address = framework_instrument(&chain, "solana", JUPITER_V6).unwrap();
+        assert_eq!(address.canonical(), JUPITER_V6);
+        assert!(address.as_pair().is_none());
     }
 }

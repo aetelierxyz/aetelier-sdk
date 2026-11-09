@@ -91,6 +91,7 @@ fn certifying_kinds_carry_structured_ids() {
         "book_delta_application",
         "book_invariants",
         "gap_detection",
+        "feed_lifecycle",
     ] {
         let kind = KINDS
             .iter()

@@ -18,6 +18,10 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `SyncMode::OnSlot` (`on_slot`) and `ClockMode::SlotDriven` (label `ON_SLOT`); `SyncMode::clock_mode`, `WorkerStatus::initial` and `IngestionCore::exchange`.
 - `transport = "grpc"` with a strict `[collect.grpc]` section (`GrpcSection`: endpoint, token env, commitment, filter and size limits).
 - Admission: `ExchangeAdapter::supported_market_types`, `ExchangeAdapter::default_emission_delay_us`, `admit_market_type`, `admit_datatypes`, `admit_registered`, `MarketWorkerConfig::admit` and `MarketWorkerManifest::resolve_admitted`.
+- `FeedSet::for_declared`.
+- `SourceMetricsSnapshot` counters `filtered_out`, `slot_gaps`, `blocks_lost`, `late_txs`, `partial_banks_discarded`, `abandoned_banks`, `fanout_overflow`, `votes_excluded`, `tx_error_decode_failures` and the gauge `behind_tip_slots`, zero on CEX venues.
+- Gap ledger cause `slot_gap` with `prev_slot`, `prev_height`, `next_slot`, `next_height` and `blocks_lost`, omitted from lines of other causes.
+- Conformance kind `feed_lifecycle` on every venue.
 
 ### Changed
 
@@ -26,6 +30,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `MarketWorker` refuses `transport = "grpc"`, `sync_mode = "on_slot"`, `market_type = "onchain"` and `[collect.datatypes.transactions]` on CEX venues. A `solana` worker needs `transport = "grpc"`, a valid `[collect.grpc]`, a base58 address, `sync_mode = "on_slot"`, no enabled `[collect.reconcile]` and a declared datatype, and fails naming the `grpc` feature while no solana adapter is built in.
 - `DataWorker` refuses chain venues, `market_type = "onchain"` and `[collect.datatypes.transactions]`.
 - `[collect.datatypes.transactions]` rejects unknown keys; a manifest with a chain venue rejects duplicate addresses and unread keys under `[collect.sync]` and `[[workers]]`.
+- `Feed`, `FeedSet` and `SourceRuntime` liveness are keyed by `Instrument`; `Feed::new` takes any `Into<Instrument>`; feed snapshots keep the `BASE/QUOTE` string.
 
 ### Fixed
 

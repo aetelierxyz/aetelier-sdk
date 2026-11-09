@@ -944,6 +944,7 @@ fn canon_frame(raw: &str) -> Option<serde_json::Value> {
 fn run_fixture_runtime(
     desc: &VenueConformance,
     declared: aetelier_connect::framework::protocol::DeclaredSet,
+    feeds: Option<aetelier_connect::framework::feed::SharedFeedSet>,
 ) -> Result<
     (
         u64,
@@ -999,6 +1000,10 @@ fn run_fixture_runtime(
             metrics.clone(),
             declared,
         );
+        let runtime = match feeds {
+            Some(feeds) => runtime.with_feeds(feeds),
+            None => runtime,
+        };
         let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(events.len() + 1);
         for ev in events {
             if ev_tx.send(ev).await.is_err() {
@@ -1125,7 +1130,8 @@ fn datatype_isolation(desc: &VenueConformance) -> Outcome {
         }
     }
 
-    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Orderbook)) {
+    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Orderbook), None)
+    {
         Ok((_books, 0, _)) => {}
         Ok((_, trades, _)) => {
             return Outcome::Fail(format!(
@@ -1134,7 +1140,7 @@ fn datatype_isolation(desc: &VenueConformance) -> Outcome {
         }
         Err(o) => return o,
     }
-    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Trades)) {
+    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Trades), None) {
         Ok((books, _trades, outcome)) => {
             if books != 0 {
                 return Outcome::Fail(format!(
@@ -1151,6 +1157,81 @@ fn datatype_isolation(desc: &VenueConformance) -> Outcome {
             }
         }
         Err(o) => return o,
+    }
+    Outcome::Pass
+}
+
+fn feed_lifecycle(desc: &VenueConformance) -> Outcome {
+    use aetelier_connect::framework::feed::{FeedSet, FeedState};
+    use aetelier_connect::framework::protocol::{DeclaredDatatype, DeclaredSet};
+    use aetelier_connect::framework::runtime::RuntimeOutcome;
+    use aetelier_types::exchanges::Exchange;
+
+    let adapter = *registry().get(desc.venue).unwrap();
+    let Ok(venue) = desc.venue.parse::<Exchange>() else {
+        return Outcome::Fail(format!("venue id {} names no exchange", desc.venue));
+    };
+    let Some(instrument) = adapter
+        .profile()
+        .symbol_codec
+        .decode_instrument(desc.wire_symbol)
+    else {
+        return Outcome::Fail(format!(
+            "codec could not decode wire symbol {}",
+            desc.wire_symbol
+        ));
+    };
+    let declared = DeclaredDatatype::ALL
+        .into_iter()
+        .filter(|dt| {
+            let class = match dt {
+                DeclaredDatatype::Orderbook => Some(Class::Book),
+                DeclaredDatatype::Trades => Some(Class::Trade),
+                DeclaredDatatype::FundingRates => Some(Class::FundingRate),
+                DeclaredDatatype::OpenInterest => Some(Class::OpenInterest),
+                DeclaredDatatype::Liquidations | DeclaredDatatype::Transactions => None,
+            };
+            !class.is_some_and(|c| desc.expect_classes.contains(&c))
+        })
+        .fold(DeclaredSet::all(), |set, dt| set.without(dt));
+    let feeds = FeedSet::for_declared(venue, &instrument, &declared).into_shared();
+    let expected = match feeds.lock() {
+        Ok(mut fs) => {
+            fs.mark_all_subscribing();
+            fs.snapshot().len()
+        }
+        Err(e) => return Outcome::Fail(format!("feed set lock poisoned: {e}")),
+    };
+    if expected == 0 {
+        return Outcome::Fail("the declared classes build no feed".into());
+    }
+    match run_fixture_runtime(desc, declared, Some(feeds.clone())) {
+        Ok((_, _, RuntimeOutcome::Finished)) => {}
+        Ok((_, _, outcome)) => {
+            return Outcome::Fail(format!(
+                "runtime ended {outcome:?} replaying the committed capture"
+            ));
+        }
+        Err(o) => return o,
+    }
+    let snapshot = match feeds.lock() {
+        Ok(fs) => fs.snapshot(),
+        Err(e) => return Outcome::Fail(format!("feed set lock poisoned: {e}")),
+    };
+    let canonical = instrument.canonical();
+    for feed in &snapshot {
+        if feed.state != FeedState::Live {
+            return Outcome::Fail(format!(
+                "{:?} feed ended {:?}, not Live",
+                feed.datatype, feed.state
+            ));
+        }
+        if feed.instrument != canonical {
+            return Outcome::Fail(format!(
+                "{:?} feed reports instrument {}, decoded {canonical}",
+                feed.datatype, feed.instrument
+            ));
+        }
     }
     Outcome::Pass
 }
@@ -1230,5 +1311,12 @@ pub const KINDS: &[Kind] = &[
                 declared interval, decimal-string parse discipline",
         invariants: &[],
         run: derivative_invariants,
+    },
+    Kind {
+        name: "feed_lifecycle",
+        atlas: "DAT-F feed lifecycle: every declared feed reaches Live under the \
+                decoded instrument, replayed through the real SourceRuntime",
+        invariants: &["DAT-F-T-3", "DAT-F-INV-4"],
+        run: feed_lifecycle,
     },
 ];

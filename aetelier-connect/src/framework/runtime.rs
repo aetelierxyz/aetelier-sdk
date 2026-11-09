@@ -17,6 +17,7 @@ use tokio::time::Instant;
 use tokio::sync::{mpsc, watch};
 
 use crate::errors::ExchangeError;
+use aetelier_types::Instrument;
 use aetelier_types::orderbooks::{NormalizedDelta, Orderbook};
 use aetelier_types::trades::Trade;
 use aetelier_types::trading_pair::TradingPair;
@@ -137,12 +138,13 @@ pub struct SourceRuntime {
     /// Worker's shared feed set; when attached, the runtime drives the
     /// per-(instrument, datatype) Live/Resubscribing transitions.
     feeds: Option<SharedFeedSet>,
-    /// Pairs already marked Live this runtime, so the hot path takes the
-    /// feeds lock only on an actual transition.
-    live_orders: HashSet<TradingPair>,
-    live_trades: HashSet<TradingPair>,
-    live_funding: HashSet<TradingPair>,
-    live_oi: HashSet<TradingPair>,
+    /// Instruments already marked Live this runtime, so the hot path takes
+    /// the feeds lock only on an actual transition.
+    live_orders: HashSet<Instrument>,
+    live_trades: HashSet<Instrument>,
+    live_funding: HashSet<Instrument>,
+    live_oi: HashSet<Instrument>,
+    live_transactions: HashSet<Instrument>,
     /// Worker-owned cross-reconnect trade-sequence carry (see
     /// [`Self::with_trade_seq_carry`]).
     trade_seq_carry: Option<Arc<std::sync::Mutex<HashMap<TradingPair, u64>>>>,
@@ -150,7 +152,7 @@ pub struct SourceRuntime {
     /// never judged silent.
     datatype_cadence: HashMap<FeedDatatype, Duration>,
     /// Last event instant per `(instrument, datatype)`, for the cadence sweep.
-    last_seen: HashMap<(TradingPair, FeedDatatype), tokio::time::Instant>,
+    last_seen: HashMap<(Instrument, FeedDatatype), tokio::time::Instant>,
 }
 
 impl SourceRuntime {
@@ -215,6 +217,7 @@ impl SourceRuntime {
             live_trades: HashSet::new(),
             live_funding: HashSet::new(),
             live_oi: HashSet::new(),
+            live_transactions: HashSet::new(),
             trade_seq_carry: None,
             datatype_cadence: HashMap::new(),
             last_seen: HashMap::new(),
@@ -592,7 +595,7 @@ impl SourceRuntime {
                     }
                 }
                 if applied {
-                    self.note_live(&pair, FeedDatatype::Orders);
+                    self.note_live(&Instrument::Pair(pair.clone()), FeedDatatype::Orders);
                 }
                 if reseed {
                     self.note_resubscribing(&pair);
@@ -684,7 +687,7 @@ impl SourceRuntime {
                 out.send(ReconstructedEvent::Trade(trade))
                     .await
                     .map_err(|_| ())?;
-                self.note_live(&pair, FeedDatatype::Trades);
+                self.note_live(&Instrument::Pair(pair), FeedDatatype::Trades);
                 Ok(false)
             }
             DomainEvent::FundingRate(fr) => {
@@ -706,7 +709,7 @@ impl SourceRuntime {
                 out.send(ReconstructedEvent::FundingRate(fr))
                     .await
                     .map_err(|_| ())?;
-                self.note_live(&pair, FeedDatatype::FundingRates);
+                self.note_live(&Instrument::Pair(pair), FeedDatatype::FundingRates);
                 Ok(false)
             }
             DomainEvent::OpenInterest(oi) => {
@@ -728,7 +731,7 @@ impl SourceRuntime {
                 out.send(ReconstructedEvent::OpenInterest(oi))
                     .await
                     .map_err(|_| ())?;
-                self.note_live(&pair, FeedDatatype::OpenInterest);
+                self.note_live(&Instrument::Pair(pair), FeedDatatype::OpenInterest);
                 Ok(false)
             }
             DomainEvent::FundingSettlement(fs) => {
@@ -871,7 +874,7 @@ impl SourceRuntime {
             }
         }
         if applied {
-            self.note_live(pair, FeedDatatype::Orders);
+            self.note_live(&Instrument::Pair(pair.clone()), FeedDatatype::Orders);
         }
         if reseed {
             self.note_resubscribing(pair);
@@ -888,7 +891,7 @@ impl SourceRuntime {
             return;
         }
         let now = tokio::time::Instant::now();
-        let overdue: Vec<(TradingPair, FeedDatatype)> = self
+        let overdue: Vec<(Instrument, FeedDatatype)> = self
             .last_seen
             .iter()
             .filter(|((_, datatype), seen)| {
@@ -896,7 +899,7 @@ impl SourceRuntime {
                     now.duration_since(**seen) > *cadence * STALE_CADENCE_MULTIPLE
                 })
             })
-            .map(|((pair, datatype), _)| (pair.clone(), *datatype))
+            .map(|((instrument, datatype), _)| (instrument.clone(), *datatype))
             .collect();
         if overdue.is_empty() {
             return;
@@ -904,23 +907,23 @@ impl SourceRuntime {
         if let Some(feeds) = &self.feeds
             && let Ok(mut fs) = feeds.lock()
         {
-            for (pair, datatype) in overdue {
+            for (instrument, datatype) in overdue {
                 tracing::warn!(
                     exchange = %self.exchange,
-                    pair = %pair,
+                    pair = %instrument,
                     ?datatype,
                     "runtime.datatype_silent_past_declared_cadence"
                 );
-                fs.mark_stale(&pair, datatype);
+                fs.mark_stale(&instrument, datatype);
             }
         }
     }
 
-    /// Record the first data for `(pair, datatype)` on the shared feed set.
-    fn note_live(&mut self, pair: &TradingPair, datatype: FeedDatatype) {
+    /// Record the first data for `(instrument, datatype)` on the shared feed set.
+    fn note_live(&mut self, instrument: &Instrument, datatype: FeedDatatype) {
         if self.datatype_cadence.contains_key(&datatype) {
             self.last_seen
-                .insert((pair.clone(), datatype), tokio::time::Instant::now());
+                .insert((instrument.clone(), datatype), tokio::time::Instant::now());
         }
         if self.feeds.is_none() {
             return;
@@ -930,9 +933,12 @@ impl SourceRuntime {
             FeedDatatype::Trades => &mut self.live_trades,
             FeedDatatype::FundingRates => &mut self.live_funding,
             FeedDatatype::OpenInterest => &mut self.live_oi,
-            FeedDatatype::Transactions => return,
+            FeedDatatype::Transactions => &mut self.live_transactions,
         };
-        let first_data = set.insert(pair.clone());
+        let first_data = !set.contains(instrument);
+        if first_data {
+            set.insert(instrument.clone());
+        }
         let cadence_watched = self.datatype_cadence.contains_key(&datatype);
         if !first_data && !cadence_watched {
             return;
@@ -940,7 +946,7 @@ impl SourceRuntime {
         if let Some(feeds) = &self.feeds
             && let Ok(mut fs) = feeds.lock()
         {
-            fs.mark_live(pair, datatype);
+            fs.mark_live(instrument, datatype);
         }
     }
 
@@ -949,11 +955,12 @@ impl SourceRuntime {
         if self.feeds.is_none() {
             return;
         }
-        self.live_orders.remove(pair);
+        let instrument = Instrument::Pair(pair.clone());
+        self.live_orders.remove(&instrument);
         if let Some(feeds) = &self.feeds
             && let Ok(mut fs) = feeds.lock()
         {
-            fs.mark_resubscribing(pair, FeedDatatype::Orders);
+            fs.mark_resubscribing(&instrument, FeedDatatype::Orders);
         }
     }
 
@@ -2619,5 +2626,236 @@ mod tests {
             assert_eq!(m.gaps, 0, "{venue}");
             assert_eq!(m.resyncs, 0, "{venue}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bare_coin_feeds_go_live_and_stale_under_the_decoded_instrument() {
+        let codec = SymbolCodec::BareCoin { quote: "USDC" };
+        let pair = codec.decode("BTC").expect("a bare coin decodes to a pair");
+        assert_eq!(pair, TradingPair::new("BTC", "USDC"));
+        let mut set = FeedSet::new(vec![
+            Feed::new(
+                Exchange::Hyperliquid,
+                pair.clone(),
+                FeedDatatype::FundingRates,
+            ),
+            Feed::new(
+                Exchange::Hyperliquid,
+                pair.clone(),
+                FeedDatatype::OpenInterest,
+            ),
+        ]);
+        set.mark_all_subscribing();
+        let feeds = set.into_shared();
+        let mut runtime = SourceRuntime::new(
+            "hyperliquid",
+            codec,
+            vec!["BTC".to_string()],
+            ReconstructionModel::FullRefresh,
+            RecoveryAction::Resubscribe,
+            SourceMetrics::default(),
+            DeclaredSet::all(),
+        )
+        .with_feeds(feeds.clone())
+        .with_datatype_cadence([
+            (FeedDatatype::FundingRates, Duration::from_millis(20)),
+            (FeedDatatype::OpenInterest, Duration::from_millis(20)),
+        ]);
+        assert_eq!(runtime.len(), 1);
+
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
+        let (seed_tx, _seed_rx) = mpsc::channel::<SeedResult>(1);
+        let mut in_flight = 0usize;
+        let seeder: Option<Arc<dyn RestSnapshot>> = None;
+
+        for ev in [funding_event(&pair), oi_event(&pair)] {
+            runtime
+                .handle_event(ev, &out_tx, &seeder, &seed_tx, &mut in_flight)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            feed_state(&feeds, &pair, FeedDatatype::FundingRates),
+            FeedState::Live
+        );
+        assert_eq!(
+            feed_state(&feeds, &pair, FeedDatatype::OpenInterest),
+            FeedState::Live
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        runtime
+            .handle_event(oi_event(&pair), &out_tx, &seeder, &seed_tx, &mut in_flight)
+            .await
+            .unwrap();
+        runtime.sweep_stale_datatypes();
+
+        assert_eq!(
+            feed_state(&feeds, &pair, FeedDatatype::FundingRates),
+            FeedState::Stale
+        );
+        assert_eq!(
+            feed_state(&feeds, &pair, FeedDatatype::OpenInterest),
+            FeedState::Live
+        );
+        let snapshot = feeds.lock().unwrap().snapshot();
+        assert!(snapshot.iter().all(|f| f.instrument == "BTC/USDC"));
+    }
+
+    #[tokio::test]
+    async fn untracked_pair_on_a_shared_socket_never_touches_a_feed() {
+        let btc = TradingPair::new("BTC", "USDT");
+        let eth = TradingPair::new("ETH", "USDT");
+        let feeds = FeedSet::new(vec![
+            Feed::new(Exchange::Bybit, btc.clone(), FeedDatatype::Orders),
+            Feed::new(Exchange::Bybit, btc.clone(), FeedDatatype::Trades),
+            Feed::new(Exchange::Bybit, eth.clone(), FeedDatatype::Orders),
+            Feed::new(Exchange::Bybit, eth.clone(), FeedDatatype::Trades),
+        ])
+        .into_shared();
+        feeds.lock().unwrap().mark_all_subscribing();
+
+        let (ev_tx, ev_rx) = mpsc::channel(16);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        for symbol in ["ETHUSDT", "BTCUSDT"] {
+            ev_tx
+                .send(DomainEvent::Book(nd(
+                    symbol,
+                    vec![("100", "1")],
+                    vec![("101", "1")],
+                    100,
+                    100,
+                    true,
+                )))
+                .await
+                .unwrap();
+        }
+        ev_tx
+            .send(DomainEvent::Trade {
+                trade: Trade {
+                    source_trade_ts_us: 1,
+                    local_trade_ts_us: 0,
+                    source_trade_rtt_us: 0,
+                    pair: eth.clone(),
+                    side: TradeSide::Buy,
+                    amount: f64_to_decimal(1.0),
+                    price: f64_to_decimal(100.0),
+                    exchange: "bybit".into(),
+                    id: "t1".into(),
+                    origin: Default::default(),
+                },
+                sequence: None,
+            })
+            .await
+            .unwrap();
+        drop(ev_tx);
+
+        let runtime = SourceRuntime::new(
+            "bybit",
+            SymbolCodec::Concat { upper: true },
+            vec!["BTCUSDT".to_string()],
+            ReconstructionModel::SeqDelta {
+                predicate: SeqPredicate::RangeInclusive,
+                source: SnapshotSource::WssSelfSeed,
+            },
+            RecoveryAction::Resubscribe,
+            SourceMetrics::default(),
+            DeclaredSet::all(),
+        )
+        .with_feeds(feeds.clone());
+        let outcome = runtime.run(ev_rx, None, out_tx, sd_rx).await;
+        assert!(matches!(outcome, RuntimeOutcome::Finished));
+
+        let mut emitted = Vec::new();
+        while let Some(ev) = out_rx.recv().await {
+            if let ReconstructedEvent::Book { pair, .. } = ev {
+                emitted.push(pair);
+            }
+        }
+        assert_eq!(emitted, std::slice::from_ref(&btc));
+        assert_eq!(
+            feed_state(&feeds, &btc, FeedDatatype::Orders),
+            FeedState::Live
+        );
+        assert_eq!(
+            feed_state(&feeds, &btc, FeedDatatype::Trades),
+            FeedState::Subscribing
+        );
+        assert_eq!(
+            feed_state(&feeds, &eth, FeedDatatype::Orders),
+            FeedState::Subscribing
+        );
+        assert_eq!(
+            feed_state(&feeds, &eth, FeedDatatype::Trades),
+            FeedState::Subscribing
+        );
+    }
+
+    const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+    const WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+
+    #[tokio::test(start_paused = true)]
+    async fn transactions_liveness_is_tracked_per_instrument() {
+        use aetelier_types::onchain::{Chain, ChainAddress};
+        let jupiter = Instrument::from(ChainAddress::solana(JUPITER_V6).unwrap());
+        let whirlpool = Instrument::from(ChainAddress::solana(WHIRLPOOL).unwrap());
+        let mut set = FeedSet::new(vec![
+            Feed::new(
+                Exchange::Solana,
+                jupiter.clone(),
+                FeedDatatype::Transactions,
+            ),
+            Feed::new(
+                Exchange::Solana,
+                whirlpool.clone(),
+                FeedDatatype::Transactions,
+            ),
+        ]);
+        set.mark_all_subscribing();
+        let feeds = set.into_shared();
+        let state = |address: &str| {
+            feeds
+                .lock()
+                .unwrap()
+                .snapshot()
+                .into_iter()
+                .find(|f| f.instrument == address)
+                .expect("feed present")
+                .state
+        };
+        let mut runtime = SourceRuntime::new(
+            "solana",
+            SymbolCodec::ChainAddress {
+                chain: Chain::Solana,
+            },
+            vec![JUPITER_V6.to_string(), WHIRLPOOL.to_string()],
+            ReconstructionModel::FullRefresh,
+            RecoveryAction::Resubscribe,
+            SourceMetrics::default(),
+            DeclaredSet::only(DeclaredDatatype::Transactions),
+        )
+        .with_feeds(feeds.clone())
+        .with_datatype_cadence([(FeedDatatype::Transactions, Duration::from_millis(20))]);
+
+        runtime.note_live(&jupiter, FeedDatatype::Transactions);
+        assert_eq!(state(JUPITER_V6), FeedState::Live);
+        assert_eq!(state(WHIRLPOOL), FeedState::Subscribing);
+
+        runtime.note_live(&whirlpool, FeedDatatype::Transactions);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        runtime.note_live(&whirlpool, FeedDatatype::Transactions);
+        runtime.sweep_stale_datatypes();
+        assert_eq!(state(JUPITER_V6), FeedState::Stale);
+        assert_eq!(state(WHIRLPOOL), FeedState::Live);
+
+        runtime.note_live(&jupiter, FeedDatatype::Transactions);
+        assert_eq!(state(JUPITER_V6), FeedState::Live);
+        assert_eq!(
+            runtime.live_transactions,
+            HashSet::from([jupiter.clone(), whirlpool.clone()])
+        );
+        assert!(runtime.live_orders.is_empty() && runtime.live_trades.is_empty());
     }
 }
