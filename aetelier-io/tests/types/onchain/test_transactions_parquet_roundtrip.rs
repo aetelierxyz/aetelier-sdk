@@ -2,7 +2,7 @@
 mod roundtrip {
     use aetelier_io::naming::{FileKind, parse_file_name};
     use aetelier_io::onchain::{
-        read_transactions_parquet, write_transactions_parquet,
+        read_transaction_keys, read_transactions_parquet, write_transactions_parquet,
         write_transactions_parquet_timestamped,
     };
     use aetelier_types::onchain::{
@@ -93,6 +93,28 @@ mod roundtrip {
         }
         write_transactions_parquet(&written, &path).unwrap();
         assert_eq!(read_transactions_parquet(&path).unwrap(), written);
+    }
+
+    #[test]
+    fn keys_reader_returns_each_row_key_in_file_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("txs.parquet");
+        let mut written = corpus();
+        written.push(base(JUPITER_V6, 380_000_125, 0, "sig-c"));
+        write_transactions_parquet(&written, &path).unwrap();
+
+        let keys = read_transaction_keys(&path).unwrap();
+
+        let address = |a: &str| ChainAddress::solana(a).unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                (address(JUPITER_V6), "sig-a".to_string()),
+                (address(JUPITER_V6), "sig-b".to_string()),
+                (address(WHIRLPOOL), "sig-c".to_string()),
+                (address(JUPITER_V6), "sig-c".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 
 use aetelier_types::onchain::{ChainAddress, Transaction};
 
@@ -54,6 +55,60 @@ pub fn check_transactions(rows: &[Transaction]) -> TransactionChecks {
         }
     }
     checks
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeafDuplicates {
+    pub count: u64,
+    pub first: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct LeafKeys {
+    seen: HashSet<[u64; 2]>,
+    hashers: [RandomState; 2],
+}
+
+impl LeafKeys {
+    pub fn with_capacity(rows: usize) -> Self {
+        let mut seen = HashSet::new();
+        let _ = seen.try_reserve(rows);
+        Self {
+            seen,
+            hashers: Default::default(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    pub fn admit(&mut self, keys: &[(ChainAddress, String)]) -> LeafDuplicates {
+        let fingerprints: Vec<[u64; 2]> = keys
+            .iter()
+            .map(|(address, signature)| {
+                let key = (address, signature.as_str());
+                [self.hashers[0].hash_one(key), self.hashers[1].hash_one(key)]
+            })
+            .collect();
+        let mut duplicates = LeafDuplicates::default();
+        for (i, ((address, signature), fingerprint)) in
+            keys.iter().zip(&fingerprints).enumerate()
+        {
+            if self.seen.contains(fingerprint) {
+                duplicates.count += 1;
+                duplicates
+                    .first
+                    .get_or_insert_with(|| format!("row {i}: ({address}, {signature})"));
+            }
+        }
+        self.seen.extend(fingerprints);
+        duplicates
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +205,56 @@ mod tests {
             check_transactions(&[no_height, failed_without_detail, failed_with_detail]);
         assert_eq!(checks.invariant_violations, 2);
         assert!(!checks.passed());
+    }
+
+    fn keys(pairs: &[(&str, &str)]) -> Vec<(ChainAddress, String)> {
+        pairs
+            .iter()
+            .map(|&(address, signature)| {
+                (
+                    ChainAddress::solana(address).unwrap(),
+                    signature.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn leaf_keys_flag_only_repeats_across_files() {
+        let mut leaf = LeafKeys::with_capacity(4);
+        assert!(leaf.is_empty());
+
+        let first = leaf.admit(&keys(&[
+            (JUPITER_V6, "a"),
+            (JUPITER_V6, "a"),
+            (JUPITER_V6, "b"),
+        ]));
+        assert_eq!(first, LeafDuplicates::default());
+        assert_eq!(leaf.len(), 2);
+
+        let second = leaf.admit(&keys(&[(JUPITER_V6, "c"), (JUPITER_V6, "b")]));
+        assert_eq!(
+            second,
+            LeafDuplicates {
+                count: 1,
+                first: Some(format!("row 1: ({JUPITER_V6}, b)")),
+            }
+        );
+        assert_eq!(leaf.len(), 3);
+    }
+
+    #[test]
+    fn leaf_keys_keep_one_signature_under_two_addresses_apart() {
+        let mut leaf = LeafKeys::default();
+        assert_eq!(
+            leaf.admit(&keys(&[(JUPITER_V6, "a")])),
+            LeafDuplicates::default()
+        );
+        assert_eq!(
+            leaf.admit(&keys(&[(WHIRLPOOL, "a")])),
+            LeafDuplicates::default()
+        );
+        assert_eq!(leaf.len(), 2);
+        assert_eq!(leaf.admit(&keys(&[(WHIRLPOOL, "a")])).count, 1);
     }
 }

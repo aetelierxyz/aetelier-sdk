@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use aetelier_types::errors::PersistError;
-use aetelier_types::onchain::Transaction;
+use aetelier_types::onchain::{ChainAddress, Transaction};
 
 pub const DATATYPE_DIR: &str = "transactions";
 
@@ -286,7 +286,7 @@ fn opt_value<A: arrow::array::Array, T>(
 
 #[cfg(feature = "parquet")]
 pub fn read_transactions_parquet(path: &Path) -> Result<Vec<Transaction>, PersistError> {
-    use aetelier_types::onchain::{ChainAddress, TransactionFailure};
+    use aetelier_types::onchain::TransactionFailure;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
 
@@ -406,6 +406,56 @@ pub fn read_transactions_parquet(path: &Path) -> Result<Vec<Transaction>, Persis
 
 #[cfg(not(feature = "parquet"))]
 pub fn read_transactions_parquet(_path: &Path) -> Result<Vec<Transaction>, PersistError> {
+    Err(PersistError::UnsupportedFormat(
+        "parquet support not compiled in (enable 'parquet' feature)".to_string(),
+    ))
+}
+
+#[cfg(feature = "parquet")]
+pub fn read_transaction_keys(
+    path: &Path,
+) -> Result<Vec<(ChainAddress, String)>, PersistError> {
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)
+        .map_err(crate::parquet_err::from_parquet)?;
+    let mask =
+        ProjectionMask::columns(builder.parquet_schema(), ["address", "signature"]);
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .map_err(crate::parquet_err::from_parquet)?;
+
+    let mut keys = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(crate::parquet_err::from_arrow)?;
+        let cols = Columns {
+            batch: &batch,
+            path,
+        };
+        let addresses = cols.strs("address")?;
+        let signatures = cols.strs("signature")?;
+        for i in 0..batch.num_rows() {
+            let address = ChainAddress::solana(addresses.value(i)).map_err(|_| {
+                PersistError::Parse(format!(
+                    "row {}: malformed address '{}' in {}",
+                    keys.len(),
+                    addresses.value(i),
+                    path.display()
+                ))
+            })?;
+            keys.push((address, signatures.value(i).to_string()));
+        }
+    }
+    Ok(keys)
+}
+
+#[cfg(not(feature = "parquet"))]
+pub fn read_transaction_keys(
+    _path: &Path,
+) -> Result<Vec<(ChainAddress, String)>, PersistError> {
     Err(PersistError::UnsupportedFormat(
         "parquet support not compiled in (enable 'parquet' feature)".to_string(),
     ))

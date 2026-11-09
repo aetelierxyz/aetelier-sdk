@@ -29,6 +29,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `DomainEvent` and `ReconstructedEvent` `Transaction`, `SlotTick`, `SlotGap`, `ConnectionLost`, `ConnectionResumed`; a slot gap is counted (`slot_gaps`, `blocks_lost`) and written to the gap ledger, never resynced.
 - `MarketSynchronizer::slot_driven`, `on_transaction` and `on_slot_tick`: a chain-time grid whose emission hold-back is measured in chain time.
 - `GapIncident::from_slot_gap`, `ExchangeAdapter::replay_stream` and `ReplayFrame`.
+- `aetelier_io::onchain::read_transaction_keys` and `LeafKeys`.
 
 ### Changed
 
@@ -39,10 +40,12 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `[collect.datatypes.transactions]` rejects unknown keys; a manifest with a chain venue rejects duplicate addresses and unread keys under `[collect.sync]` and `[[workers]]`.
 - `Feed`, `FeedSet` and `SourceRuntime` liveness are keyed by `Instrument`; `Feed::new` takes any `Into<Instrument>`; feed snapshots keep the `BASE/QUOTE` string.
 - `FeedSet::mark_all_reconnecting` and `mark_all_subscribing` leave feeds already in the target state unchanged.
+- `validate` walks `<exchange>/<market_type>/<datatype>/<binding_id>/<YYYY-MM-DD>/` leaves as well as `<exchange>/<datatype>/`, takes a leaf's files from its `index.jsonl` when present, and counts pending files and torn index lines. T11 checks `(address, signature)` across the files of a leaf day.
 
 ### Fixed
 
 - Workers flushing into the same leaf in one process could delete each other's staged Parquet file in the `.staging` sweep, failing the flush with `ENOENT` and forcing a retry. Flushes into one leaf are now serialized in-process.
+- A file left unlisted by a crashed flush is reported as pending instead of validated, so it no longer overlaps its retried sibling in T10.
 
 ## v0.1.1 — 2026-10-06
 
