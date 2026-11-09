@@ -1156,6 +1156,46 @@ impl MarketWorker {
 
                     ev = recon_rx.recv() => match ev {
                         Some(ev) => {
+                            let ev = match ev {
+                                ReconstructedEvent::SlotGap(gap) => {
+                                    if let Some(ledger) = &gap_ledger {
+                                        let incident =
+                                            crate::workers::gap_ledger::GapIncident::from_slot_gap(
+                                                &gap,
+                                                &exchange_name,
+                                                &symbol,
+                                            );
+                                        if let Err(e) = ledger.append(&incident) {
+                                            metrics.bump_flush_failures();
+                                            tracing::warn!(
+                                                error = %e,
+                                                "market_worker.gap_ledger_append_failed"
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                                ReconstructedEvent::ConnectionLost { reason } => {
+                                    reconnects += 1;
+                                    metrics.bump_reconnects();
+                                    connection_state = crate::ConnectionState::Reconnecting {
+                                        attempt: reconnects,
+                                    };
+                                    tracing::warn!(
+                                        exchange = exchange_name.as_str(),
+                                        symbol = symbol.as_str(),
+                                        attempt = reconnects,
+                                        %reason,
+                                        "market_worker.stream_reconnecting"
+                                    );
+                                    continue;
+                                }
+                                ReconstructedEvent::ConnectionResumed => {
+                                    connection_state = crate::ConnectionState::Subscribing;
+                                    continue;
+                                }
+                                other => other,
+                            };
                             total_events += 1;
                             events_since_last_tick += 1;
                             connection_state = crate::ConnectionState::Streaming;
@@ -1186,10 +1226,11 @@ impl MarketWorker {
                                     let window_us =
                                         opened.elapsed().as_micros() as u64;
                                     metrics.record_book_gap_incident(window_us);
-                                    let estimated = metrics
-                                        .snapshot()
-                                        .trade_loss_confidence
-                                        == crate::framework::budget::TradeLossConfidence::Estimated as u64;
+                                    let estimated = model.reconstructs_books()
+                                        && metrics
+                                            .snapshot()
+                                            .trade_loss_confidence
+                                            == crate::framework::budget::TradeLossConfidence::Estimated as u64;
                                     let mut estimate = None;
                                     if estimated {
                                         while recent_trades.front().is_some_and(
@@ -1324,6 +1365,27 @@ impl MarketWorker {
                                     }
                                     sync.on_trade(trade);
                                 }
+                                ReconstructedEvent::Transaction(tx) => {
+                                    sync.on_transaction(*tx);
+                                }
+                                ReconstructedEvent::SlotTick(tick) => {
+                                    if tick.block_time_us > 0 {
+                                        let now_us = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_micros() as u64;
+                                        let sample = now_us.saturating_sub(tick.block_time_us) as f64;
+                                        latency_us_ewma = if latency_us_ewma <= 0.0 {
+                                            sample
+                                        } else {
+                                            0.2 * sample + 0.8 * latency_us_ewma
+                                        };
+                                    }
+                                    sync.on_slot_tick(tick.block_time_us);
+                                }
+                                ReconstructedEvent::SlotGap(_)
+                                | ReconstructedEvent::ConnectionLost { .. }
+                                | ReconstructedEvent::ConnectionResumed => {}
                             }
                             if !external_clock {
                                 let n = drain_and_emit(&mut sync, &sinks);

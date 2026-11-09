@@ -25,6 +25,10 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `aetelier_connect::framework::slotbook`: `SourcedSlotbook` assembles transactions per `(slot, bank_id)`, seals each bank on its block meta, releases banks in block-height order with a bounded reorder hold, opens coverage after each subscribe, and reports `SlotGap`, `SlotTick` and loss counters.
 - `aetelier_connect::framework::onchain`: decoded transaction input, address roles, the watched-address predicate, requested compute, `failure_*` derivation and `transaction_rows` for `transactions.v1`.
 - `aetelier_types::onchain::encode_base58`.
+- `ReconstructionModel::Stream` (book level `none`; no books, no seeding).
+- `DomainEvent` and `ReconstructedEvent` `Transaction`, `SlotTick`, `SlotGap`, `ConnectionLost`, `ConnectionResumed`; a slot gap is counted (`slot_gaps`, `blocks_lost`) and written to the gap ledger, never resynced.
+- `MarketSynchronizer::slot_driven`, `on_transaction` and `on_slot_tick`: a chain-time grid whose emission hold-back is measured in chain time.
+- `GapIncident::from_slot_gap`, `ExchangeAdapter::replay_stream` and `ReplayFrame`.
 
 ### Changed
 
@@ -34,6 +38,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `DataWorker` refuses chain venues, `market_type = "onchain"` and `[collect.datatypes.transactions]`.
 - `[collect.datatypes.transactions]` rejects unknown keys; a manifest with a chain venue rejects duplicate addresses and unread keys under `[collect.sync]` and `[[workers]]`.
 - `Feed`, `FeedSet` and `SourceRuntime` liveness are keyed by `Instrument`; `Feed::new` takes any `Into<Instrument>`; feed snapshots keep the `BASE/QUOTE` string.
+- `FeedSet::mark_all_reconnecting` and `mark_all_subscribing` leave feeds already in the target state unchanged.
 
 ### Fixed
 

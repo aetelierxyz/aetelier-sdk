@@ -242,6 +242,259 @@ mod tests {
         let out = tokio::time::timeout(STOP_DRAIN_TIMEOUT, flush).await;
         assert!(out.is_err(), "stuck consumer must trip the drain bound");
     }
+
+    const HYPERLIQUID_FRAMES: &str =
+        include_str!("../../datasets/hyperliquid/btc_book_trade.jsonl");
+
+    fn hyperliquid_events()
+    -> Vec<crate::sources::hyperliquid::events::HyperliquidWssEvent> {
+        use crate::sources::hyperliquid::decoder::HyperliquidDecoder;
+        HYPERLIQUID_FRAMES
+            .lines()
+            .filter_map(|line| HyperliquidDecoder::decode(line.trim()).unwrap())
+            .collect()
+    }
+
+    fn unstamped(ev: &DomainEvent) -> String {
+        let mut ev = ev.clone();
+        ev.stamp_local(0, 0, 0, 0);
+        format!("{ev:?}")
+    }
+
+    fn stamps(ev: &DomainEvent) -> (u64, Option<u64>, Option<(u64, u64)>) {
+        match ev {
+            DomainEvent::Book(d) => (
+                d.local_orderbook_ts_us,
+                Some(d.source_orderbook_rtt_us),
+                None,
+            ),
+            DomainEvent::Trade { trade, .. } => (
+                trade.local_trade_ts_us,
+                Some(trade.source_trade_rtt_us),
+                None,
+            ),
+            DomainEvent::FundingRate(fr) => (
+                fr.local_funding_ts_us,
+                None,
+                Some((fr.recv_seq, fr.conn_epoch_us)),
+            ),
+            DomainEvent::OpenInterest(oi) => (
+                oi.local_oi_ts_us,
+                None,
+                Some((oi.recv_seq, oi.conn_epoch_us)),
+            ),
+            other => panic!("the hyperliquid normalizer emitted {other:?}"),
+        }
+    }
+
+    fn expected_hyperliquid_events() -> Vec<(usize, String)> {
+        use crate::framework::adapters::hyperliquid::HyperliquidNormalizer;
+        let normalizer = HyperliquidNormalizer::default();
+        let mut expected = Vec::new();
+        for (frame, event) in hyperliquid_events().into_iter().enumerate() {
+            for ev in normalizer.normalize(event) {
+                expected.push((frame, unstamped(&ev)));
+            }
+        }
+        for kind in ["Book(", "Trade {", "FundingRate(", "OpenInterest("] {
+            assert!(
+                expected.iter().any(|(_, shape)| shape.starts_with(kind)),
+                "the fixture exercises {kind}"
+            );
+        }
+        expected
+    }
+
+    #[tokio::test]
+    async fn drain_stamps_real_hyperliquid_frames_in_order() {
+        use crate::framework::adapters::hyperliquid::HyperliquidNormalizer;
+        const RECEIPT_US: u64 = 1_785_932_639_900_000;
+        const EPOCH_US: u64 = 1_785_932_600_000_000;
+        let expected = expected_hyperliquid_events();
+        let frames = hyperliquid_events();
+        let (raw_tx, mut raw_rx) = mpsc::channel(frames.len());
+        for (frame, event) in frames.into_iter().enumerate() {
+            raw_tx.try_send((event, RECEIPT_US + frame as u64)).unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel::<DomainEvent>(expected.len() + 1);
+        let rtt = AtomicU64::new(1_250);
+        let normalizer = HyperliquidNormalizer::default();
+
+        let flush = drain_buffered(&mut raw_rx, &normalizer, &tx, &rtt, 40, EPOCH_US);
+        tokio::time::timeout(STOP_DRAIN_TIMEOUT, flush)
+            .await
+            .expect("a drain into an open downstream completes");
+        drop(tx);
+        assert!(raw_rx.try_recv().is_err(), "every buffered frame drained");
+
+        let mut got = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            got.push(ev);
+        }
+        assert_eq!(got.len(), expected.len());
+        for (n, (ev, (frame, shape))) in got.iter().zip(&expected).enumerate() {
+            assert_eq!(&unstamped(ev), shape, "event {n} keeps its wire order");
+            let (local_us, rtt_us, sequenced) = stamps(ev);
+            assert_eq!(local_us, RECEIPT_US + *frame as u64, "event {n}");
+            if let Some(rtt_us) = rtt_us {
+                assert_eq!(rtt_us, 1_250, "event {n}");
+            }
+            if let Some((recv_seq, conn_epoch_us)) = sequenced {
+                assert_eq!(recv_seq, 40 + n as u64 + 1, "event {n}");
+                assert_eq!(conn_epoch_us, EPOCH_US, "event {n}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_stops_at_a_closed_downstream() {
+        use crate::framework::adapters::hyperliquid::HyperliquidNormalizer;
+        let expected = expected_hyperliquid_events();
+        let frames = hyperliquid_events();
+        let total = frames.len();
+        let (raw_tx, mut raw_rx) = mpsc::channel(total);
+        for (frame, event) in frames.into_iter().enumerate() {
+            raw_tx.try_send((event, 1 + frame as u64)).unwrap();
+        }
+        let (tx, rx) = mpsc::channel::<DomainEvent>(expected.len() + 1);
+        drop(rx);
+        let rtt = AtomicU64::new(0);
+        let normalizer = HyperliquidNormalizer::default();
+
+        let flush = drain_buffered(&mut raw_rx, &normalizer, &tx, &rtt, 0, 11);
+        tokio::time::timeout(STOP_DRAIN_TIMEOUT, flush)
+            .await
+            .expect("a closed downstream ends the drain at once");
+
+        let mut left = 0;
+        while raw_rx.try_recv().is_ok() {
+            left += 1;
+        }
+        let consumed = expected[0].0 + 1;
+        assert_eq!(
+            left,
+            total - consumed,
+            "the drain stops at the first refused send"
+        );
+    }
+
+    struct LocalVenue(String);
+
+    impl ProtocolHooks for LocalVenue {
+        fn endpoint(&self) -> String {
+            self.0.clone()
+        }
+
+        fn subscribe_frames(
+            &self,
+            _symbols: &[String],
+            _declared: &aetelier_types::config::markets::market_config::DeclaredSet,
+        ) -> Vec<tokio_tungstenite::tungstenite::protocol::Message> {
+            vec![tokio_tungstenite::tungstenite::protocol::Message::Text(
+                "subscribe".into(),
+            )]
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_stamps_real_hyperliquid_frames_end_to_end() {
+        use crate::framework::adapters::hyperliquid::HyperliquidNormalizer;
+        use crate::sources::hyperliquid::decoder::HyperliquidDecoder;
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
+
+        let expected = expected_hyperliquid_events();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _subscribe = ws.next().await;
+            for line in HYPERLIQUID_FRAMES.lines() {
+                if ws
+                    .send(Message::Text(line.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = ws
+                .close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "".into(),
+                }))
+                .await;
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let (tx, mut rx) = mpsc::channel::<DomainEvent>(DEFAULT_RAW_BUFFER);
+        let collector = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                got.push(ev);
+            }
+            got
+        });
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let metrics = SourceMetrics::default();
+        let before_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive::<LocalVenue, HyperliquidDecoder, HyperliquidNormalizer>(
+                Arc::new(LocalVenue(format!("ws://{addr}"))),
+                vec!["BTC".to_string()],
+                aetelier_types::config::markets::market_config::DeclaredSet::all(),
+                HyperliquidNormalizer::default(),
+                tx,
+                sd_rx,
+                DEFAULT_RAW_BUFFER,
+                metrics.clone(),
+            ),
+        )
+        .await
+        .expect("a closed capture ends the drive");
+        let after_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        drop(sd_tx);
+        assert!(matches!(exit, TaskExit::Completed), "{exit:?}");
+        let got = collector.await.unwrap();
+
+        assert_eq!(got.len(), expected.len());
+        let conn_epoch_us = metrics.conn_epoch_us();
+        assert!(conn_epoch_us >= before_us && conn_epoch_us <= after_us);
+        let mut frame_stamp: Option<(usize, (u64, Option<u64>))> = None;
+        for (n, (ev, (frame, shape))) in got.iter().zip(&expected).enumerate() {
+            assert_eq!(&unstamped(ev), shape, "event {n} keeps its wire order");
+            let (local_us, rtt_us, sequenced) = stamps(ev);
+            assert!(
+                local_us >= before_us && local_us <= after_us,
+                "event {n} carries its receipt time"
+            );
+            if let Some((recv_seq, epoch_us)) = sequenced {
+                assert_eq!(recv_seq, n as u64 + 1, "event {n}");
+                assert_eq!(epoch_us, conn_epoch_us, "event {n}");
+            }
+            match frame_stamp {
+                Some((last, stamp)) if last == *frame => {
+                    assert_eq!(stamp.0, local_us, "one receipt per frame (event {n})");
+                    if let (Some(a), Some(b)) = (stamp.1, rtt_us) {
+                        assert_eq!(a, b, "one round-trip per frame (event {n})");
+                    }
+                }
+                _ => frame_stamp = Some((*frame, (local_us, rtt_us))),
+            }
+        }
+        let m = metrics.snapshot();
+        assert_eq!(m.msgs, hyperliquid_events().len() as u64);
+        assert_eq!(m.decode_err, 0);
+    }
 }
 
 #[cfg(test)]

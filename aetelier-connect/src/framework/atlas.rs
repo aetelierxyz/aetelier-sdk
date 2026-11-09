@@ -54,6 +54,8 @@ pub const METRIC_EMITTERS: &[(&str, &[&str])] = &[
     ("trades_recovered", &["DAT-RC-INV-4"]),
     ("reconcile_fetches", &["DAT-RC-INV-2", "DAT-RC-INV-4"]),
     ("reconcile_failures", &["DAT-RC-INV-4"]),
+    ("slot_gaps", &["DAT-SK-T-16"]),
+    ("blocks_lost", &["DAT-SK-T-16"]),
 ];
 
 /// Validate an id against the shape documented above, without a regex

@@ -683,6 +683,11 @@ impl DataWorker {
                                 }
                                 // Handled above; unreachable here.
                                 crate::framework::model::DomainEvent::ConnectionGap { .. } => 0,
+                                crate::framework::model::DomainEvent::Transaction(_)
+                                | crate::framework::model::DomainEvent::SlotTick(_)
+                                | crate::framework::model::DomainEvent::SlotGap(_)
+                                | crate::framework::model::DomainEvent::ConnectionLost { .. }
+                                | crate::framework::model::DomainEvent::ConnectionResumed => 0,
                             };
                             if ev_ts > 0 {
                                 let now_us = std::time::SystemTime::now()
@@ -709,6 +714,11 @@ impl DataWorker {
                                     oi_topic.as_deref()
                                 }
                                 crate::framework::model::DomainEvent::ConnectionGap { .. } => None,
+                                crate::framework::model::DomainEvent::Transaction(_)
+                                | crate::framework::model::DomainEvent::SlotTick(_)
+                                | crate::framework::model::DomainEvent::SlotGap(_)
+                                | crate::framework::model::DomainEvent::ConnectionLost { .. }
+                                | crate::framework::model::DomainEvent::ConnectionResumed => None,
                             };
                             if let Some(topic) = topic {
                                 let now_us = std::time::SystemTime::now()

@@ -47,6 +47,7 @@ pub enum Class {
     FundingRate,
     OpenInterest,
     FundingSettlement,
+    Transaction,
 }
 
 /// Per-venue conformance descriptor. Fixtures + doc-derived expectations only.

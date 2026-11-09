@@ -8,7 +8,7 @@
 use aetelier_connect::framework::model::{
     DomainEvent, OrderBookState, ReconstructionModel, SourcedOrderbook,
 };
-use aetelier_connect::framework::registry::registry;
+use aetelier_connect::framework::registry::{ExchangeAdapter, registry};
 use aetelier_types::orderbooks::NormalizedDelta;
 use aetelier_types::trading_pair::TradingPair;
 use rust_decimal::Decimal;
@@ -17,19 +17,40 @@ use super::harness::{
     Class, Kind, Outcome, VenueConformance, fixture_lines, fixture_raw,
 };
 
+fn stateless_replay_applies(model: &ReconstructionModel) -> Result<(), Outcome> {
+    match model {
+        ReconstructionModel::FullRefresh
+        | ReconstructionModel::SeqDelta { .. }
+        | ReconstructionModel::ChecksumDelta { .. }
+        | ReconstructionModel::L3 { .. } => Ok(()),
+        ReconstructionModel::Stream => Err(Outcome::NotApplicable(
+            "stream model: frames replay through replay_stream, not replay_frame".into(),
+        )),
+    }
+}
+
 /// Replay every fixture frame through the adapter's real decode+normalize
 /// path; collect the DomainEvents. Errors surface the venue id + the frame.
-fn replay_all(desc: &VenueConformance) -> Result<Vec<DomainEvent>, String> {
-    let adapter = *registry().get(desc.venue).unwrap();
-    let lines = fixture_lines(desc.ws_fixture)?;
+fn replay_all(desc: &VenueConformance) -> Result<Vec<DomainEvent>, Outcome> {
+    replay_fixture(*registry().get(desc.venue).unwrap(), desc.ws_fixture)
+}
+
+fn replay_fixture(
+    adapter: &dyn ExchangeAdapter,
+    ws_fixture: &str,
+) -> Result<Vec<DomainEvent>, Outcome> {
+    stateless_replay_applies(&adapter.book_model("orders"))?;
+    let lines = fixture_lines(ws_fixture).map_err(Outcome::Fail)?;
     if lines.is_empty() {
-        return Err(format!("fixture {} has no frames", desc.ws_fixture));
+        return Err(Outcome::Fail(format!("fixture {ws_fixture} has no frames")));
     }
     let mut events = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         match adapter.replay_frame(line) {
             Ok(mut evs) => events.append(&mut evs),
-            Err(e) => return Err(format!("frame {i} failed to decode: {e}")),
+            Err(e) => {
+                return Err(Outcome::Fail(format!("frame {i} failed to decode: {e}")));
+            }
         }
     }
     Ok(events)
@@ -45,7 +66,7 @@ fn derivative_invariants(desc: &VenueConformance) -> Outcome {
     }
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let mut fr_seen = 0usize;
     let mut oi_seen = 0usize;
@@ -104,6 +125,11 @@ fn class_of(ev: &DomainEvent) -> Option<Class> {
         DomainEvent::FundingRate(_) => Some(Class::FundingRate),
         DomainEvent::OpenInterest(_) => Some(Class::OpenInterest),
         DomainEvent::FundingSettlement(_) => Some(Class::FundingSettlement),
+        DomainEvent::Transaction(_) => Some(Class::Transaction),
+        DomainEvent::SlotTick(_)
+        | DomainEvent::SlotGap(_)
+        | DomainEvent::ConnectionLost { .. }
+        | DomainEvent::ConnectionResumed => None,
     }
 }
 
@@ -114,7 +140,7 @@ fn class_of(ev: &DomainEvent) -> Option<Class> {
 fn decode_surface(desc: &VenueConformance) -> Outcome {
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     if events.is_empty() {
         return Outcome::Fail("no DomainEvents produced from the fixture".into());
@@ -146,6 +172,9 @@ fn decode_surface(desc: &VenueConformance) -> Outcome {
 fn seeding_taxonomy(desc: &VenueConformance) -> Outcome {
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
+    if !model.reconstructs_books() {
+        return Outcome::NotApplicable("stream model: no order book to seed".into());
+    }
     if !desc.expect_source.matches(model.snapshot_source()) {
         return Outcome::Fail(format!(
             "snapshot source: doc expects {:?}, model has {:?}",
@@ -227,7 +256,7 @@ fn symbol_canonicalization(desc: &VenueConformance) -> Outcome {
 fn trade_continuity(desc: &VenueConformance) -> Outcome {
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let seqs: Vec<u64> = events
         .iter()
@@ -272,7 +301,7 @@ fn trade_continuity(desc: &VenueConformance) -> Outcome {
 fn reconstruct_book(desc: &VenueConformance) -> Result<(SourcedOrderbook, u64), Outcome> {
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
-    let events = replay_all(desc).map_err(Outcome::Fail)?;
+    let events = replay_all(desc)?;
     let deltas: Vec<_> = events
         .into_iter()
         .filter_map(|ev| match ev {
@@ -516,7 +545,7 @@ fn trade_invariants(desc: &VenueConformance) -> Outcome {
 
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let mut seen = 0u64;
     for ev in &events {
@@ -559,7 +588,7 @@ fn checksum_validation(desc: &VenueConformance) -> Outcome {
     }
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let deltas: Vec<_> = events
         .into_iter()
@@ -633,7 +662,7 @@ fn seeded_book_and_deltas(
 ) -> Result<(SourcedOrderbook, Vec<NormalizedDelta>), Outcome> {
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
-    let events = replay_all(desc).map_err(Outcome::Fail)?;
+    let events = replay_all(desc)?;
     let deltas: Vec<NormalizedDelta> = events
         .into_iter()
         .filter_map(|ev| match ev {
@@ -752,6 +781,9 @@ fn gap_detection(desc: &VenueConformance) -> Outcome {
             );
         }
         ReconstructionModel::SeqDelta { .. } => {}
+        ReconstructionModel::Stream => {
+            return Outcome::NotApplicable("stream model: no order book to gap".into());
+        }
     }
 
     let (mut book, post) = match seeded_book_and_deltas(desc) {
@@ -810,7 +842,7 @@ fn book_runtime_replay(desc: &VenueConformance) -> Outcome {
     let model = adapter.book_model("orders");
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     if !events.iter().any(|ev| matches!(ev, DomainEvent::Book(_))) {
         if desc.expect_classes.contains(&Class::Book) {
@@ -959,7 +991,7 @@ fn run_fixture_runtime(
 
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
-    let events = replay_all(desc).map_err(Outcome::Fail)?;
+    let events = replay_all(desc)?;
 
     struct FixedSeeder2(NormalizedDelta);
 
@@ -1320,3 +1352,75 @@ pub const KINDS: &[Kind] = &[
         run: feed_lifecycle,
     },
 ];
+
+#[test]
+fn stream_models_never_reach_replay_frame() {
+    use aetelier_connect::framework::budget::{ConnectionBudget, SourceMetrics};
+    use aetelier_connect::framework::protocol::DeclaredSet;
+    use aetelier_connect::framework::registry::{ExchangeProfile, TaskExit};
+    use aetelier_connect::framework::symbol::SymbolCodec;
+    use aetelier_types::onchain::Chain;
+
+    struct StreamVenue(ExchangeProfile);
+
+    impl ExchangeAdapter for StreamVenue {
+        fn id(&self) -> &'static str {
+            "solana"
+        }
+
+        fn profile(&self) -> &ExchangeProfile {
+            &self.0
+        }
+
+        fn book_model(&self, _channel: &str) -> ReconstructionModel {
+            ReconstructionModel::Stream
+        }
+
+        fn spawn(
+            &self,
+            _symbols: Vec<String>,
+            _declared: DeclaredSet,
+            _tx: tokio::sync::mpsc::Sender<DomainEvent>,
+            _shutdown: tokio::sync::watch::Receiver<bool>,
+            _metrics: SourceMetrics,
+        ) -> tokio::task::JoinHandle<TaskExit> {
+            unreachable!("conformance replays offline")
+        }
+
+        fn replay_frame(
+            &self,
+            raw: &str,
+        ) -> Result<Vec<DomainEvent>, Box<aetelier_connect::errors::ExchangeError>>
+        {
+            panic!("a stream model reached replay_frame with {raw}")
+        }
+    }
+
+    let stream = StreamVenue(ExchangeProfile {
+        id: "solana",
+        symbol_codec: SymbolCodec::ChainAddress {
+            chain: Chain::Solana,
+        },
+        budget: ConnectionBudget::default(),
+        schema_version: 1,
+        protocol_revision: "solana-stream",
+    });
+    match replay_fixture(&stream, "hyperliquid/btc_book_trade.jsonl") {
+        Err(Outcome::NotApplicable(reason)) => {
+            assert!(reason.contains("replay_stream"), "{reason}");
+        }
+        Err(other) => panic!("expected NotApplicable, got {other:?}"),
+        Ok(events) => panic!("a stream model replayed {} events", events.len()),
+    }
+    for (id, adapter) in registry() {
+        assert!(
+            stateless_replay_applies(&adapter.book_model("orders")).is_ok(),
+            "{id}"
+        );
+    }
+    let hyperliquid = *registry().get("hyperliquid").unwrap();
+    match replay_fixture(hyperliquid, "hyperliquid/btc_book_trade.jsonl") {
+        Ok(events) => assert!(!events.is_empty()),
+        Err(other) => panic!("a book venue must replay its frames: {other:?}"),
+    }
+}

@@ -1,6 +1,10 @@
 //! Unit tests for `MarketSynchronizer` with `ClockMode` support.
 
 use aetelier_connect::synchronizers::{ClockMode, MarketSynchronizer};
+use aetelier_types::onchain::{
+    ChainAddress, Commitment, MatchRole, Transaction, TransactionVersion,
+};
+use aetelier_types::snapshots::MarketSnapshot;
 use aetelier_types::{
     Level, Liquidation, OrderSide, Trade, TradeSide,
     funding::FundingRate,
@@ -811,4 +815,308 @@ fn test_settlement_arriving_ahead_of_grid_stays_buffered_then_lands() {
         .sum();
     assert_eq!(landed, 1);
     assert_eq!(sync.late_events_dropped, 0);
+}
+
+const CHAIN_T0: u64 = 1_791_321_067 * PERIOD_1S;
+
+fn make_tx(block_time_us: u64, slot: u64, tx_index: u64) -> Transaction {
+    Transaction {
+        exchange: "solana".to_string(),
+        address: ChainAddress::solana("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")
+            .unwrap(),
+        match_role: MatchRole::AccountKey,
+        source_tx_ts_us: block_time_us,
+        local_tx_ts_us: block_time_us + 650_000,
+        source_tx_rtt_us: 900,
+        recv_seq: slot * 100 + tx_index,
+        conn_epoch_us: 1_791_321_000_000_000,
+        commitment: Commitment::Finalized,
+        slot,
+        block_height: slot - 22_000_000,
+        blockhash: "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn".to_string(),
+        tx_index,
+        signature: format!("sig-{slot}-{tx_index}"),
+        version: TransactionVersion::Legacy,
+        success: true,
+        fee_lamports: 5_000,
+        compute_units_consumed: Some(41_215),
+        compute_unit_limit: None,
+        compute_unit_price_micro_lamports: None,
+        priority_fee_lamports: None,
+        cost_units: None,
+        signers: Vec::new(),
+        account_keys: Vec::new(),
+        log_messages: None,
+        failure: None,
+    }
+}
+
+fn tx_keys(snapshot: &MarketSnapshot) -> Vec<(u64, u64)> {
+    snapshot
+        .transactions
+        .iter()
+        .map(|tx| (tx.slot, tx.tx_index))
+        .collect()
+}
+
+#[test]
+fn slot_driven_first_tick_anchors_without_emission() {
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    assert_eq!(sync.clock_mode(), ClockMode::SlotDriven);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 0));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    assert_eq!(sync.buffer_len(), 0);
+    assert_eq!(sync.total_captured(), 0);
+    assert_eq!(sync.late_events_dropped, 0);
+}
+
+#[test]
+fn slot_ticks_emit_rows_labelled_on_chain_time_with_their_transactions() {
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 3));
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 7));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_011, 0));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    sync.on_transaction(make_tx(CHAIN_T0 + PERIOD_1S, 380_000_013, 2));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + PERIOD_1S), 1);
+
+    let rows = sync.drain();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].ts_us, CHAIN_T0 + PERIOD_1S);
+    assert_eq!(
+        tx_keys(&rows[0]),
+        [(380_000_010, 3), (380_000_010, 7), (380_000_011, 0)]
+    );
+    assert!(rows[0].orderbook.is_none() && rows[0].trades.is_empty());
+
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + 2 * PERIOD_1S), 1);
+    let rows = sync.drain();
+    assert_eq!(rows[0].ts_us, CHAIN_T0 + 2 * PERIOD_1S);
+    assert_eq!(tx_keys(&rows[0]), [(380_000_013, 2)]);
+    assert_eq!(sync.late_events_dropped, 0);
+}
+
+#[test]
+fn a_quiet_address_ticks_rows_without_content() {
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    let mut emitted = 0;
+    for second in 1..=3 {
+        for _bank in 0..3 {
+            emitted += sync.on_slot_tick(CHAIN_T0 + second * PERIOD_1S);
+        }
+    }
+    assert_eq!(emitted, 3);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + 6 * PERIOD_1S), 3);
+
+    let rows = sync.drain();
+    let labels: Vec<u64> = rows.iter().map(|r| r.ts_us).collect();
+    let expected: Vec<u64> = (1..=6).map(|k| CHAIN_T0 + k * PERIOD_1S).collect();
+    assert_eq!(labels, expected);
+    assert!(rows.iter().all(|r| {
+        r.transactions.is_empty()
+            && r.trades.is_empty()
+            && r.orderbook.is_none()
+            && r.funding_rate.is_empty()
+    }));
+}
+
+#[test]
+fn slot_hold_back_is_measured_in_chain_time() {
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    sync.set_emission_delay_us(2 * PERIOD_1S);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 0));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + PERIOD_1S), 1);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + 2 * PERIOD_1S), 1);
+    let early = sync.drain();
+    assert!(early.iter().all(|r| r.ts_us <= CHAIN_T0));
+    assert!(early.iter().all(|r| r.transactions.is_empty()));
+
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_011, 1));
+    assert_eq!(sync.on_time(CHAIN_T0 + 60 * PERIOD_1S), 0);
+    assert!(
+        sync.drain().is_empty(),
+        "wall-clock time never ripens a slot row"
+    );
+
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + 3 * PERIOD_1S), 1);
+    let rows = sync.drain();
+    assert_eq!(rows[0].ts_us, CHAIN_T0 + PERIOD_1S);
+    assert_eq!(tx_keys(&rows[0]), [(380_000_010, 0), (380_000_011, 1)]);
+    assert_eq!(sync.late_events_dropped, 0);
+}
+
+#[test]
+fn a_transaction_for_an_emitted_row_is_dropped_and_counted() {
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 0));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + PERIOD_1S), 1);
+    assert_eq!(tx_keys(&sync.drain()[0]), [(380_000_010, 0)]);
+
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 5));
+    sync.on_transaction(make_tx(CHAIN_T0 + PERIOD_1S, 380_000_014, 0));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + 2 * PERIOD_1S), 1);
+    assert_eq!(sync.late_events_dropped, 1);
+    let rows = sync.drain();
+    assert_eq!(rows[0].ts_us, CHAIN_T0 + 2 * PERIOD_1S);
+    assert_eq!(tx_keys(&rows[0]), [(380_000_014, 0)]);
+
+    sync.finalize();
+    let tail = sync.drain();
+    assert!(
+        tail.iter()
+            .chain(&rows)
+            .all(|r| r.transactions.iter().all(|tx| tx.tx_index != 5)),
+        "the late row is never re-homed"
+    );
+}
+
+#[test]
+fn slot_ticks_drive_only_the_slot_clock() {
+    let later = CHAIN_T0 + 5 * PERIOD_1S;
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    assert_eq!(sync.on_time(later), 0);
+    assert_eq!(sync.on_trade(make_trade(later, 100.0, 1.0)), 0);
+    assert_eq!(
+        sync.on_liquidation(make_liquidation(later, 100.0, 1.0, TradeSide::Buy)),
+        0
+    );
+    assert_eq!(sync.on_orderbook(&btcusdt(), later, make_ob(later)), 0);
+    assert_eq!(sync.buffer_len(), 0);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + PERIOD_1S), 1);
+    let rows = sync.drain();
+    assert_eq!(rows[0].ts_us, CHAIN_T0 + PERIOD_1S);
+    assert!(rows[0].trades.is_empty() && rows[0].orderbook.is_none());
+
+    for mode in [
+        ClockMode::OrderbookDriven,
+        ClockMode::TradeDriven,
+        ClockMode::LiquidationDriven,
+        ClockMode::ExternalClock,
+    ] {
+        let mut other = MarketSynchronizer::with_clock_mode(PERIOD_1S, mode);
+        assert_eq!(other.on_slot_tick(CHAIN_T0), 0, "{mode:?}");
+        assert_eq!(other.on_slot_tick(later), 0, "{mode:?}");
+        assert_eq!(other.buffer_len(), 0, "{mode:?}");
+        assert_eq!(other.late_events_dropped, 0, "{mode:?}");
+    }
+}
+
+#[test]
+fn transactions_ride_the_external_clock_passively() {
+    let mut sync = MarketSynchronizer::external_clock(PERIOD_1S);
+    assert_eq!(sync.on_time(CHAIN_T0), 0);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 0));
+    sync.on_trade(make_trade(CHAIN_T0 + 300_000, 100.0, 1.0));
+    sync.on_transaction(make_tx(CHAIN_T0 + PERIOD_1S, 380_000_013, 4));
+    assert_eq!(sync.buffer_len(), 0);
+    assert_eq!(sync.on_time(CHAIN_T0 + PERIOD_1S), 1);
+
+    let rows = sync.drain();
+    assert_eq!(rows[0].ts_us, CHAIN_T0 + PERIOD_1S);
+    assert_eq!(tx_keys(&rows[0]), [(380_000_010, 0)]);
+    assert_eq!(rows[0].trades.len(), 1);
+
+    sync.finalize();
+    let tail = sync.drain();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tx_keys(&tail[0]), [(380_000_013, 4)]);
+    assert_eq!(sync.late_events_dropped, 0);
+}
+
+#[test]
+fn finalize_slot_driven_closes_with_buffered_transactions() {
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 0));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + PERIOD_1S), 1);
+    assert_eq!(tx_keys(&sync.drain()[0]), [(380_000_010, 0)]);
+
+    sync.on_transaction(make_tx(CHAIN_T0 + PERIOD_1S, 380_000_012, 3));
+    sync.on_transaction(make_tx(CHAIN_T0 + PERIOD_1S, 380_000_013, 1));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + PERIOD_1S), 0);
+    sync.finalize();
+    assert!(sync.is_finalized());
+
+    let tail = sync.drain();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].ts_us, CHAIN_T0 + 2 * PERIOD_1S);
+    assert_eq!(tx_keys(&tail[0]), [(380_000_012, 3), (380_000_013, 1)]);
+    sync.finalize();
+    assert!(sync.drain().is_empty());
+    assert_eq!(sync.late_events_dropped, 0);
+}
+
+#[test]
+fn transactions_after_finalize_are_dropped_and_counted() {
+    let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+    assert_eq!(sync.on_slot_tick(CHAIN_T0), 0);
+    sync.on_transaction(make_tx(CHAIN_T0, 380_000_010, 0));
+    sync.finalize();
+    assert_eq!(tx_keys(&sync.drain()[0]), [(380_000_010, 0)]);
+    let before = sync.late_events_dropped;
+
+    sync.on_transaction(make_tx(CHAIN_T0 + PERIOD_1S, 380_000_013, 0));
+    assert_eq!(sync.on_slot_tick(CHAIN_T0 + 3 * PERIOD_1S), 0);
+    assert_eq!(sync.late_events_dropped - before, 2);
+    assert_eq!(sync.buffer_len(), 0);
+}
+
+#[test]
+fn identical_slot_sequences_yield_identical_grids() {
+    enum Step {
+        Row(u64, u64, u64),
+        Tick(u64),
+    }
+    let s = PERIOD_1S;
+    let steps = [
+        Step::Row(CHAIN_T0, 380_000_010, 2),
+        Step::Row(CHAIN_T0, 380_000_010, 9),
+        Step::Tick(CHAIN_T0),
+        Step::Tick(CHAIN_T0),
+        Step::Row(CHAIN_T0 + s, 380_000_013, 0),
+        Step::Tick(CHAIN_T0 + s),
+        Step::Row(CHAIN_T0, 380_000_011, 4),
+        Step::Tick(CHAIN_T0 + 2 * s),
+        Step::Tick(CHAIN_T0 + 3 * s),
+        Step::Row(CHAIN_T0 + s, 380_000_014, 1),
+        Step::Tick(CHAIN_T0 + 6 * s),
+        Step::Row(CHAIN_T0 + 6 * s, 380_000_021, 0),
+        Step::Tick(CHAIN_T0 + 6 * s),
+    ];
+    let replay = || {
+        let mut sync = MarketSynchronizer::slot_driven(PERIOD_1S);
+        sync.set_emission_delay_us(2 * PERIOD_1S);
+        let mut rows = Vec::new();
+        for step in &steps {
+            match *step {
+                Step::Row(block_time_us, slot, tx_index) => {
+                    sync.on_transaction(make_tx(block_time_us, slot, tx_index));
+                }
+                Step::Tick(block_time_us) => {
+                    sync.on_slot_tick(block_time_us);
+                }
+            }
+            rows.extend(sync.drain());
+        }
+        sync.finalize();
+        rows.extend(sync.drain());
+        (
+            serde_json::to_string(&rows).unwrap(),
+            rows.iter().map(tx_keys).collect::<Vec<_>>(),
+            sync.late_events_dropped,
+            sync.total_captured(),
+        )
+    };
+
+    let first = replay();
+    assert_eq!(first, replay());
+    let carried: usize = first.1.iter().map(Vec::len).sum();
+    assert_eq!(carried + first.2 as usize, 6);
+    assert!(first.0.contains("sig-380000013-0"));
 }

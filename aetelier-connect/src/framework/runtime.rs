@@ -29,6 +29,7 @@ use super::model::{
     TradeApply,
 };
 use super::rest::RestSnapshot;
+use super::slotbook::{SlotGap, SlotTick};
 use super::symbol::SymbolCodec;
 use crate::synchronizers::capture_levels;
 use aetelier_types::config::markets::market_config::{DeclaredDatatype, DeclaredSet};
@@ -46,6 +47,13 @@ pub enum ReconstructedEvent {
     FundingRate(aetelier_types::funding::FundingRate),
     OpenInterest(aetelier_types::open_interest::OpenInterest),
     FundingSettlement(aetelier_types::funding::FundingSettlement),
+    Transaction(Box<aetelier_types::onchain::Transaction>),
+    SlotTick(SlotTick),
+    SlotGap(SlotGap),
+    ConnectionLost {
+        reason: String,
+    },
+    ConnectionResumed,
 }
 
 /// Why the runtime loop ended.
@@ -145,6 +153,8 @@ pub struct SourceRuntime {
     live_funding: HashSet<Instrument>,
     live_oi: HashSet<Instrument>,
     live_transactions: HashSet<Instrument>,
+    tracked: HashSet<Instrument>,
+    reconnecting: bool,
     /// Worker-owned cross-reconnect trade-sequence carry (see
     /// [`Self::with_trade_seq_carry`]).
     trade_seq_carry: Option<Arc<std::sync::Mutex<HashMap<TradingPair, u64>>>>,
@@ -156,9 +166,9 @@ pub struct SourceRuntime {
 }
 
 impl SourceRuntime {
-    /// Build a runtime for `wire_symbols` (decoded to canonical pairs via
-    /// `codec`). Symbols that fail to decode are skipped. `metrics` is the
-    /// worker's shared counter handle.
+    /// Build a runtime for `wire_symbols` (decoded via `codec` to pairs, or to
+    /// instruments for a stream model). Symbols that fail to decode are skipped.
+    /// `metrics` is the worker's shared counter handle.
     pub fn new(
         exchange: impl Into<String>,
         codec: SymbolCodec,
@@ -173,7 +183,19 @@ impl SourceRuntime {
         let seeds_out_of_band = model.seeds_out_of_band() && book_active;
         let requested = wire_symbols.len();
         let mut books = HashMap::new();
+        let mut tracked = HashSet::new();
         for wire in wire_symbols {
+            if !model.reconstructs_books() {
+                match codec.decode_instrument(&wire) {
+                    Some(instrument) => {
+                        tracked.insert(instrument);
+                    }
+                    None => {
+                        tracing::warn!(symbol = %wire, "runtime.symbol_undecodable_skipped");
+                    }
+                }
+                continue;
+            }
             let Some(pair) = codec.decode(&wire) else {
                 tracing::warn!(symbol = %wire, "runtime.symbol_undecodable_skipped");
                 continue;
@@ -200,7 +222,7 @@ impl SourceRuntime {
                 },
             );
         }
-        if books.is_empty() && requested > 0 {
+        if books.is_empty() && tracked.is_empty() && requested > 0 {
             tracing::error!(requested, "runtime.no_decodable_symbols");
         }
         Self {
@@ -218,6 +240,8 @@ impl SourceRuntime {
             live_funding: HashSet::new(),
             live_oi: HashSet::new(),
             live_transactions: HashSet::new(),
+            tracked,
+            reconnecting: false,
             trade_seq_carry: None,
             datatype_cadence: HashMap::new(),
             last_seen: HashMap::new(),
@@ -275,13 +299,13 @@ impl SourceRuntime {
         self
     }
 
-    /// Number of tracked pairs.
+    /// Number of tracked instruments.
     pub fn len(&self) -> usize {
-        self.books.len()
+        self.books.len() + self.tracked.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.books.is_empty()
+        self.books.is_empty() && self.tracked.is_empty()
     }
 
     /// Consume `events` (an adapter's `DomainEvent` output), reconstruct each
@@ -744,6 +768,91 @@ impl SourceRuntime {
                     .map_err(|_| ())?;
                 Ok(false)
             }
+            DomainEvent::Transaction(tx) => {
+                if !self.declared.contains(DeclaredDatatype::Transactions) {
+                    self.metrics.bump_undeclared_dropped();
+                    if self
+                        .undeclared_warned
+                        .insert(DeclaredDatatype::Transactions)
+                    {
+                        tracing::warn!(
+                            exchange = %self.exchange,
+                            datatype = "transactions",
+                            "runtime.undeclared_event_dropped"
+                        );
+                    }
+                    return Ok(false);
+                }
+                if !self.tracked.contains(&Instrument::Address(tx.address)) {
+                    return Ok(false);
+                }
+                out.send(ReconstructedEvent::Transaction(tx))
+                    .await
+                    .map_err(|_| ())?;
+                Ok(false)
+            }
+            DomainEvent::SlotTick(tick) => {
+                out.send(ReconstructedEvent::SlotTick(tick))
+                    .await
+                    .map_err(|_| ())?;
+                if self.declared.contains(DeclaredDatatype::Transactions) {
+                    let tracked = std::mem::take(&mut self.tracked);
+                    for instrument in &tracked {
+                        self.note_live(instrument, FeedDatatype::Transactions);
+                    }
+                    self.tracked = tracked;
+                }
+                Ok(false)
+            }
+            DomainEvent::SlotGap(gap) => {
+                self.metrics.bump_slot_gaps();
+                self.metrics.add_blocks_lost(gap.blocks_lost());
+                tracing::warn!(
+                    exchange = %self.exchange,
+                    prev_slot = gap.prev_slot,
+                    next_slot = gap.next_slot,
+                    blocks_lost = gap.blocks_lost(),
+                    "runtime.slot_gap_blocks_lost"
+                );
+                out.send(ReconstructedEvent::SlotGap(gap))
+                    .await
+                    .map_err(|_| ())?;
+                Ok(false)
+            }
+            DomainEvent::ConnectionLost { reason } => {
+                if !self.reconnecting {
+                    self.reconnecting = true;
+                    self.live_orders.clear();
+                    self.live_trades.clear();
+                    self.live_funding.clear();
+                    self.live_oi.clear();
+                    self.live_transactions.clear();
+                    self.last_seen.clear();
+                    if let Some(feeds) = &self.feeds
+                        && let Ok(mut fs) = feeds.lock()
+                    {
+                        fs.mark_all_reconnecting();
+                    }
+                }
+                out.send(ReconstructedEvent::ConnectionLost { reason })
+                    .await
+                    .map_err(|_| ())?;
+                Ok(false)
+            }
+            DomainEvent::ConnectionResumed => {
+                if self.reconnecting {
+                    self.reconnecting = false;
+                    if let Some(feeds) = &self.feeds
+                        && let Ok(mut fs) = feeds.lock()
+                    {
+                        fs.mark_all_subscribing();
+                    }
+                }
+                out.send(ReconstructedEvent::ConnectionResumed)
+                    .await
+                    .map_err(|_| ())?;
+                Ok(false)
+            }
         }
     }
 
@@ -921,6 +1030,9 @@ impl SourceRuntime {
 
     /// Record the first data for `(instrument, datatype)` on the shared feed set.
     fn note_live(&mut self, instrument: &Instrument, datatype: FeedDatatype) {
+        if self.reconnecting {
+            return;
+        }
         if self.datatype_cadence.contains_key(&datatype) {
             self.last_seen
                 .insert((instrument.clone(), datatype), tokio::time::Instant::now());
@@ -1686,6 +1798,11 @@ mod tests {
             ReconstructedEvent::FundingRate(_) => "FundingRate",
             ReconstructedEvent::OpenInterest(_) => "OpenInterest",
             ReconstructedEvent::FundingSettlement(_) => "FundingSettlement",
+            ReconstructedEvent::Transaction(_) => "Transaction",
+            ReconstructedEvent::SlotTick(_) => "SlotTick",
+            ReconstructedEvent::SlotGap(_) => "SlotGap",
+            ReconstructedEvent::ConnectionLost { .. } => "ConnectionLost",
+            ReconstructedEvent::ConnectionResumed => "ConnectionResumed",
         }
     }
 
@@ -2857,5 +2974,712 @@ mod tests {
             HashSet::from([jupiter.clone(), whirlpool.clone()])
         );
         assert!(runtime.live_orders.is_empty() && runtime.live_trades.is_empty());
+    }
+
+    use crate::framework::onchain::decoded::fixtures::{decoded, key};
+    use crate::framework::onchain::{RowContext, WatchedAddress, transaction_rows};
+    use crate::framework::slotbook::BlockContext;
+    use aetelier_types::config::markets::market_config::TransactionsConfig;
+    use aetelier_types::onchain::{ChainAddress, Commitment};
+
+    const SLOT: u64 = 380_000_000;
+    const HEIGHT_OFFSET: u64 = 22_000_000;
+    const CHAIN_T0_US: u64 = 1_791_321_067_000_000;
+    const BLOCKHASH: &str = "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn";
+
+    fn watched(address: ChainAddress) -> WatchedAddress {
+        WatchedAddress::new(address, &TransactionsConfig::default())
+    }
+
+    fn row_context() -> RowContext<'static> {
+        RowContext {
+            exchange: "solana",
+            commitment: Commitment::Finalized,
+        }
+    }
+
+    fn chain_tick(slot: u64) -> SlotTick {
+        SlotTick {
+            slot,
+            block_height: slot - HEIGHT_OFFSET,
+            block_time_us: CHAIN_T0_US + (slot - SLOT) * 400_000,
+        }
+    }
+
+    fn chain_row(address: ChainAddress, slot: u64, tx_index: u64) -> DomainEvent {
+        let tick = chain_tick(slot);
+        let block = BlockContext {
+            slot,
+            block_height: tick.block_height,
+            block_time_us: tick.block_time_us,
+            blockhash: BLOCKHASH,
+        };
+        let row = transaction_rows(
+            block,
+            &decoded(tx_index),
+            [&watched(address)],
+            row_context(),
+        )
+        .pop()
+        .expect("the fixture transaction touches the address");
+        DomainEvent::Transaction(Box::new(row))
+    }
+
+    fn stream_runtime(
+        addresses: &[ChainAddress],
+        declared: DeclaredSet,
+        metrics: SourceMetrics,
+    ) -> SourceRuntime {
+        SourceRuntime::new(
+            "solana",
+            SymbolCodec::ChainAddress {
+                chain: aetelier_types::onchain::Chain::Solana,
+            },
+            addresses.iter().map(ChainAddress::to_base58).collect(),
+            ReconstructionModel::Stream,
+            ReconstructionModel::Stream.recovery_action(),
+            metrics,
+            declared,
+        )
+    }
+
+    fn address_feeds(addresses: &[ChainAddress]) -> SharedFeedSet {
+        let mut set = FeedSet::new(
+            addresses
+                .iter()
+                .map(|a| Feed::new(Exchange::Solana, *a, FeedDatatype::Transactions))
+                .collect(),
+        );
+        set.mark_all_subscribing();
+        set.into_shared()
+    }
+
+    fn address_state(feeds: &SharedFeedSet, address: &ChainAddress) -> FeedState {
+        let canonical = address.to_base58();
+        feeds
+            .lock()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .find(|f| {
+                f.instrument == canonical && f.datatype == FeedDatatype::Transactions
+            })
+            .expect("transactions feed present")
+            .state
+    }
+
+    fn only_transactions() -> DeclaredSet {
+        DeclaredSet::only(DeclaredDatatype::Transactions)
+    }
+
+    fn release_label(ev: &ReconstructedEvent) -> String {
+        match ev {
+            ReconstructedEvent::Transaction(tx) => {
+                format!("row {}:{} {}", tx.slot, tx.tx_index, tx.address)
+            }
+            ReconstructedEvent::SlotTick(tick) => format!("tick {}", tick.slot),
+            ReconstructedEvent::SlotGap(gap) => {
+                format!(
+                    "gap {}->{} lost {}",
+                    gap.prev_slot,
+                    gap.next_slot,
+                    gap.blocks_lost()
+                )
+            }
+            other => reconstructed_kind(other).to_string(),
+        }
+    }
+
+    struct Handler {
+        out: mpsc::Sender<ReconstructedEvent>,
+        seed_tx: mpsc::Sender<SeedResult>,
+        _seed_rx: mpsc::Receiver<SeedResult>,
+        seeder: Option<Arc<dyn RestSnapshot>>,
+        in_flight: usize,
+    }
+
+    impl Handler {
+        fn new(out: mpsc::Sender<ReconstructedEvent>) -> Self {
+            let (seed_tx, seed_rx) = mpsc::channel::<SeedResult>(1);
+            Self {
+                out,
+                seed_tx,
+                _seed_rx: seed_rx,
+                seeder: None,
+                in_flight: 0,
+            }
+        }
+
+        async fn feed(&mut self, runtime: &mut SourceRuntime, ev: DomainEvent) -> bool {
+            runtime
+                .handle_event(
+                    ev,
+                    &self.out,
+                    &self.seeder,
+                    &self.seed_tx,
+                    &mut self.in_flight,
+                )
+                .await
+                .expect("the output stays open")
+        }
+    }
+
+    async fn drained(mut out_rx: mpsc::Receiver<ReconstructedEvent>) -> Vec<String> {
+        let mut labels = Vec::new();
+        while let Some(ev) = out_rx.recv().await {
+            labels.push(release_label(&ev));
+        }
+        labels
+    }
+
+    #[test]
+    fn a_stream_runtime_tracks_its_address_and_builds_no_book() {
+        let address = key(3);
+        for declared in [only_transactions(), DeclaredSet::all()] {
+            let runtime =
+                stream_runtime(&[address, address], declared, SourceMetrics::default());
+            assert_eq!(runtime.len(), 1);
+            assert!(!runtime.is_empty());
+            assert!(runtime.books.is_empty(), "a stream model builds no book");
+            assert_eq!(
+                runtime.tracked,
+                HashSet::from([Instrument::Address(address)])
+            );
+            assert!(!runtime.needs_rest && !runtime.seeds_out_of_band);
+        }
+
+        let cex = SourceRuntime::new(
+            "binance",
+            SymbolCodec::Concat { upper: true },
+            vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+            binance_model(),
+            RecoveryAction::RestSnapshot,
+            SourceMetrics::default(),
+            DeclaredSet::all(),
+        );
+        assert_eq!(cex.len(), 2);
+        assert_eq!(cex.books.len(), 2);
+        assert!(
+            cex.tracked.is_empty(),
+            "a book model tracks through its books"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_stream_symbol_is_skipped() {
+        let address = key(3);
+        let wire = vec![
+            "BTC/USDC".to_string(),
+            String::new(),
+            "0OIl".to_string(),
+            "11111111".to_string(),
+            address.to_base58(),
+        ];
+        let runtime = SourceRuntime::new(
+            "solana",
+            SymbolCodec::ChainAddress {
+                chain: aetelier_types::onchain::Chain::Solana,
+            },
+            wire,
+            ReconstructionModel::Stream,
+            RecoveryAction::Resubscribe,
+            SourceMetrics::default(),
+            only_transactions(),
+        );
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(
+            runtime.tracked,
+            HashSet::from([Instrument::Address(address)])
+        );
+
+        let none = SourceRuntime::new(
+            "solana",
+            SymbolCodec::ChainAddress {
+                chain: aetelier_types::onchain::Chain::Solana,
+            },
+            vec!["BTC/USDC".to_string(), "SOLUSDC".to_string()],
+            ReconstructionModel::Stream,
+            RecoveryAction::Resubscribe,
+            SourceMetrics::default(),
+            only_transactions(),
+        );
+        assert!(none.is_empty());
+        assert_eq!(none.len(), 0);
+        assert!(none.books.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stream_feed_goes_live_on_the_first_slot_tick_not_on_rows() {
+        let address = key(3);
+        let feeds = address_feeds(&[address]);
+        let mut runtime =
+            stream_runtime(&[address], only_transactions(), SourceMetrics::default())
+                .with_feeds(feeds.clone());
+        let (out_tx, out_rx) = mpsc::channel(16);
+        let mut handler = Handler::new(out_tx);
+
+        for tx_index in 0..3 {
+            let resync = handler
+                .feed(&mut runtime, chain_row(address, SLOT, tx_index))
+                .await;
+            assert!(!resync);
+        }
+        assert_eq!(address_state(&feeds, &address), FeedState::Subscribing);
+        assert!(
+            runtime.live_transactions.is_empty(),
+            "rows never mark liveness"
+        );
+
+        assert!(
+            !handler
+                .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT)))
+                .await
+        );
+        assert_eq!(address_state(&feeds, &address), FeedState::Live);
+        assert_eq!(
+            runtime.live_transactions,
+            HashSet::from([Instrument::Address(address)])
+        );
+        assert!(
+            !handler
+                .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT + 1)))
+                .await
+        );
+        assert_eq!(address_state(&feeds, &address), FeedState::Live);
+
+        drop(handler);
+        let labels = drained(out_rx).await;
+        assert_eq!(
+            labels,
+            [
+                format!("row {SLOT}:0 {address}"),
+                format!("row {SLOT}:1 {address}"),
+                format!("row {SLOT}:2 {address}"),
+                format!("tick {SLOT}"),
+                format!("tick {}", SLOT + 1),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_address_stays_live_on_slot_ticks_and_goes_stale_without_them() {
+        let busy = key(2);
+        let quiet = key(3);
+        let feeds = address_feeds(&[busy, quiet]);
+        let mut runtime = stream_runtime(
+            &[busy, quiet],
+            only_transactions(),
+            SourceMetrics::default(),
+        )
+        .with_feeds(feeds.clone())
+        .with_datatype_cadence([(FeedDatatype::Transactions, Duration::from_millis(20))]);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
+        let mut handler = Handler::new(out_tx);
+
+        for step in 0..6 {
+            handler
+                .feed(&mut runtime, chain_row(busy, SLOT + step, step))
+                .await;
+            handler
+                .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT + step)))
+                .await;
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            runtime.sweep_stale_datatypes();
+            assert_eq!(address_state(&feeds, &busy), FeedState::Live, "step {step}");
+            assert_eq!(
+                address_state(&feeds, &quiet),
+                FeedState::Live,
+                "step {step}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        runtime.sweep_stale_datatypes();
+        assert_eq!(address_state(&feeds, &busy), FeedState::Stale);
+        assert_eq!(address_state(&feeds, &quiet), FeedState::Stale);
+
+        handler
+            .feed(&mut runtime, chain_row(busy, SLOT + 9, 9))
+            .await;
+        assert_eq!(
+            address_state(&feeds, &busy),
+            FeedState::Stale,
+            "a row is not a liveness signal"
+        );
+        handler
+            .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT + 9)))
+            .await;
+        assert_eq!(address_state(&feeds, &busy), FeedState::Live);
+        assert_eq!(address_state(&feeds, &quiet), FeedState::Live);
+    }
+
+    #[tokio::test]
+    async fn a_slot_gap_is_counted_and_forwarded_never_resynced() {
+        let address = key(3);
+        let metrics = SourceMetrics::default();
+        let feeds = address_feeds(&[address]);
+        let position = |slot: u64| {
+            let tick = chain_tick(slot);
+            crate::framework::slotbook::SlotPosition {
+                slot: tick.slot,
+                block_height: tick.block_height,
+                block_time_us: tick.block_time_us,
+            }
+        };
+        let first = SlotGap::between(position(SLOT), position(SLOT + 8));
+        assert_eq!(first.blocks_lost(), 7);
+        let second = SlotGap {
+            prev_slot: SLOT + 8,
+            prev_height: SLOT + 8 - HEIGHT_OFFSET,
+            prev_block_time_us: chain_tick(SLOT + 8).block_time_us,
+            next_slot: SLOT + 11,
+            next_height: SLOT + 10 - HEIGHT_OFFSET,
+            next_block_time_us: chain_tick(SLOT + 11).block_time_us,
+        };
+        assert_eq!(second.blocks_lost(), 1);
+
+        let (ev_tx, ev_rx) = mpsc::channel(16);
+        for ev in [
+            DomainEvent::SlotTick(chain_tick(SLOT)),
+            DomainEvent::SlotGap(first),
+            chain_row(address, SLOT + 8, 0),
+            DomainEvent::SlotTick(chain_tick(SLOT + 8)),
+            DomainEvent::SlotGap(second),
+            DomainEvent::SlotTick(chain_tick(SLOT + 11)),
+        ] {
+            ev_tx.send(ev).await.unwrap();
+        }
+        drop(ev_tx);
+        let (out_tx, out_rx) = mpsc::channel(16);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let outcome = stream_runtime(&[address], only_transactions(), metrics.clone())
+            .with_feeds(feeds.clone())
+            .run(ev_rx, None, out_tx, sd_rx)
+            .await;
+
+        assert!(
+            matches!(outcome, RuntimeOutcome::Finished),
+            "a slot gap never asks for a resync"
+        );
+        assert_eq!(address_state(&feeds, &address), FeedState::Live);
+        let m = metrics.snapshot();
+        assert_eq!((m.slot_gaps, m.blocks_lost), (2, 8));
+        assert_eq!((m.gaps, m.resyncs, m.reconnects), (0, 0, 0));
+        assert_eq!(
+            drained(out_rx).await,
+            [
+                format!("tick {SLOT}"),
+                format!("gap {SLOT}->{} lost 7", SLOT + 8),
+                format!("row {}:0 {address}", SLOT + 8),
+                format!("tick {}", SLOT + 8),
+                format!("gap {}->{} lost 1", SLOT + 8, SLOT + 11),
+                format!("tick {}", SLOT + 11),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_and_ticks_reach_the_worker_in_release_order() {
+        use crate::framework::onchain::DecodedTransaction;
+        use crate::framework::slotbook::{
+            BlockMeta, CoverageStart, SlotBookConfig, SourcedSlotbook,
+        };
+        let address = key(3);
+        let meta = |slot: u64, parent_slot: u64, height: u64, secs: i64| BlockMeta {
+            slot,
+            bank_id: 0,
+            parent_slot,
+            block_height: Some(height),
+            block_time_secs: Some(secs),
+            blockhash: BLOCKHASH.to_string(),
+        };
+        let mut book: SourcedSlotbook<DecodedTransaction> =
+            SourcedSlotbook::new(SlotBookConfig::default());
+        book.open_coverage(CoverageStart::AtSlot(SLOT));
+        let h0 = SLOT - HEIGHT_OFFSET;
+        let mut released = Vec::new();
+        book.on_transaction(SLOT + 1, 0, 3, decoded(3));
+        book.on_transaction(SLOT + 1, 0, 1, decoded(1));
+        book.on_transaction(SLOT, 0, 2, decoded(2));
+        released.extend(
+            book.on_block_meta(meta(SLOT + 1, SLOT, h0 + 1, 1_791_321_068))
+                .released,
+        );
+        assert!(released.is_empty(), "the child waits for its parent");
+        released.extend(
+            book.on_block_meta(meta(SLOT, SLOT - 1, h0, 1_791_321_067))
+                .released,
+        );
+        book.on_transaction(SLOT + 4, 0, 0, decoded(0));
+        released.extend(
+            book.on_block_meta(meta(SLOT + 4, SLOT + 3, h0 + 3, 1_791_321_069))
+                .released,
+        );
+        released.extend(book.close_coverage());
+        assert_eq!(released.len(), 3);
+
+        let mut sent = Vec::new();
+        for bank in &released {
+            if let Some(gap) = bank.gap {
+                sent.push(DomainEvent::SlotGap(gap));
+            }
+            for tx in &bank.txs {
+                for row in
+                    transaction_rows(bank.block(), tx, [&watched(address)], row_context())
+                {
+                    sent.push(DomainEvent::Transaction(Box::new(row)));
+                }
+            }
+            sent.push(DomainEvent::SlotTick(bank.tick()));
+        }
+
+        let metrics = SourceMetrics::default();
+        let feeds = address_feeds(&[address]);
+        let (ev_tx, ev_rx) = mpsc::channel(sent.len() + 1);
+        for ev in sent {
+            ev_tx.send(ev).await.unwrap();
+        }
+        drop(ev_tx);
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let outcome = stream_runtime(&[address], only_transactions(), metrics.clone())
+            .with_feeds(feeds.clone())
+            .run(ev_rx, None, out_tx, sd_rx)
+            .await;
+        assert!(matches!(outcome, RuntimeOutcome::Finished));
+
+        assert_eq!(
+            drained(out_rx).await,
+            [
+                format!("row {SLOT}:2 {address}"),
+                format!("tick {SLOT}"),
+                format!("row {}:1 {address}", SLOT + 1),
+                format!("row {}:3 {address}", SLOT + 1),
+                format!("tick {}", SLOT + 1),
+                format!("gap {}->{} lost 1", SLOT + 1, SLOT + 4),
+                format!("row {}:0 {address}", SLOT + 4),
+                format!("tick {}", SLOT + 4),
+            ]
+        );
+        let m = metrics.snapshot();
+        assert_eq!((m.slot_gaps, m.blocks_lost, m.resyncs), (1, 1, 0));
+        assert_eq!(book.counters().slot_gaps, m.slot_gaps);
+        assert_eq!(book.counters().blocks_lost, m.blocks_lost);
+        assert_eq!(address_state(&feeds, &address), FeedState::Live);
+    }
+
+    #[tokio::test]
+    async fn transactions_for_untracked_addresses_are_dropped() {
+        let tracked = key(3);
+        let untracked = key(4);
+        let metrics = SourceMetrics::default();
+        let feeds = address_feeds(&[tracked]);
+        let mut runtime =
+            stream_runtime(&[tracked], only_transactions(), metrics.clone())
+                .with_feeds(feeds.clone());
+        let (out_tx, out_rx) = mpsc::channel(16);
+        let mut handler = Handler::new(out_tx);
+
+        for ev in [
+            chain_row(untracked, SLOT, 0),
+            chain_row(tracked, SLOT, 1),
+            chain_row(untracked, SLOT, 2),
+            DomainEvent::Book(nd(
+                "BTCUSDT",
+                vec![("100", "1")],
+                vec![("101", "1")],
+                1,
+                1,
+                true,
+            )),
+        ] {
+            assert!(!handler.feed(&mut runtime, ev).await);
+        }
+        assert_eq!(address_state(&feeds, &tracked), FeedState::Subscribing);
+        let m = metrics.snapshot();
+        assert_eq!(m.undeclared_dropped, 1, "only the undeclared book counts");
+        assert_eq!((m.gaps, m.resyncs), (0, 0));
+
+        drop(handler);
+        assert_eq!(drained(out_rx).await, [format!("row {SLOT}:1 {tracked}")]);
+    }
+
+    #[tokio::test]
+    async fn undeclared_transactions_are_dropped_and_counted() {
+        let address = key(3);
+        let metrics = SourceMetrics::default();
+        let feeds = address_feeds(&[address]);
+        let mut runtime = stream_runtime(
+            &[address],
+            DeclaredSet::only(DeclaredDatatype::Trades),
+            metrics.clone(),
+        )
+        .with_feeds(feeds.clone());
+        let (out_tx, out_rx) = mpsc::channel(16);
+        let mut handler = Handler::new(out_tx);
+
+        for tx_index in 0..3 {
+            assert!(
+                !handler
+                    .feed(&mut runtime, chain_row(address, SLOT, tx_index))
+                    .await
+            );
+        }
+        assert!(
+            !handler
+                .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT)))
+                .await
+        );
+
+        assert_eq!(metrics.snapshot().undeclared_dropped, 3);
+        assert!(
+            runtime
+                .undeclared_warned
+                .contains(&DeclaredDatatype::Transactions)
+        );
+        assert_eq!(
+            address_state(&feeds, &address),
+            FeedState::Subscribing,
+            "an undeclared datatype never goes live"
+        );
+        drop(handler);
+        assert_eq!(drained(out_rx).await, [format!("tick {SLOT}")]);
+    }
+
+    #[tokio::test]
+    async fn connection_loss_walks_reconnecting_subscribing_live_without_resubscribing() {
+        let address = key(3);
+        let metrics = SourceMetrics::default();
+        let feeds = address_feeds(&[address]);
+        let mut runtime =
+            stream_runtime(&[address], only_transactions(), metrics.clone())
+                .with_feeds(feeds.clone());
+        let (out_tx, out_rx) = mpsc::channel(32);
+        let mut handler = Handler::new(out_tx);
+        let mut walk = vec![address_state(&feeds, &address)];
+        let lost = || DomainEvent::ConnectionLost {
+            reason: "stream reset by peer".to_string(),
+        };
+
+        for ev in [
+            DomainEvent::SlotTick(chain_tick(SLOT)),
+            lost(),
+            lost(),
+            chain_row(address, SLOT + 1, 0),
+            DomainEvent::SlotTick(chain_tick(SLOT + 1)),
+            DomainEvent::ConnectionResumed,
+            DomainEvent::ConnectionResumed,
+            DomainEvent::SlotTick(chain_tick(SLOT + 2)),
+        ] {
+            assert!(
+                !handler.feed(&mut runtime, ev).await,
+                "a reconnect is never a resync"
+            );
+            walk.push(address_state(&feeds, &address));
+        }
+
+        assert_eq!(
+            walk,
+            [
+                FeedState::Subscribing,
+                FeedState::Live,
+                FeedState::Reconnecting,
+                FeedState::Reconnecting,
+                FeedState::Reconnecting,
+                FeedState::Reconnecting,
+                FeedState::Subscribing,
+                FeedState::Subscribing,
+                FeedState::Live,
+            ]
+        );
+        assert!(!runtime.reconnecting);
+        let m = metrics.snapshot();
+        assert_eq!((m.gaps, m.resyncs, m.reconnects), (0, 0, 0));
+
+        drop(handler);
+        assert_eq!(
+            drained(out_rx).await,
+            [
+                format!("tick {SLOT}"),
+                "ConnectionLost".to_string(),
+                "ConnectionLost".to_string(),
+                format!("row {}:0 {address}", SLOT + 1),
+                format!("tick {}", SLOT + 1),
+                "ConnectionResumed".to_string(),
+                "ConnectionResumed".to_string(),
+                format!("tick {}", SLOT + 2),
+            ]
+        );
+
+        let mut fs = feeds.lock().unwrap();
+        fs.mark_all_reconnecting();
+        fs.mark_all_reconnecting();
+        fs.mark_all_subscribing();
+        drop(fs);
+        assert_eq!(address_state(&feeds, &address), FeedState::Subscribing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_is_not_reported_as_silence() {
+        let address = key(3);
+        let feeds = address_feeds(&[address]);
+        let mut runtime =
+            stream_runtime(&[address], only_transactions(), SourceMetrics::default())
+                .with_feeds(feeds.clone())
+                .with_datatype_cadence([(
+                    FeedDatatype::Transactions,
+                    Duration::from_millis(20),
+                )]);
+        let (out_tx, mut out_rx) = mpsc::channel(32);
+        tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
+        let mut handler = Handler::new(out_tx);
+
+        handler
+            .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT)))
+            .await;
+        assert_eq!(address_state(&feeds, &address), FeedState::Live);
+        handler
+            .feed(
+                &mut runtime,
+                DomainEvent::ConnectionLost {
+                    reason: "transport error".to_string(),
+                },
+            )
+            .await;
+        assert!(runtime.last_seen.is_empty());
+        assert!(runtime.live_transactions.is_empty());
+
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            runtime.sweep_stale_datatypes();
+            assert_eq!(address_state(&feeds, &address), FeedState::Reconnecting);
+        }
+        handler
+            .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT + 1)))
+            .await;
+        assert!(
+            runtime.last_seen.is_empty(),
+            "no liveness while reconnecting"
+        );
+
+        handler
+            .feed(&mut runtime, DomainEvent::ConnectionResumed)
+            .await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        runtime.sweep_stale_datatypes();
+        assert_eq!(address_state(&feeds, &address), FeedState::Subscribing);
+
+        handler
+            .feed(&mut runtime, DomainEvent::SlotTick(chain_tick(SLOT + 2)))
+            .await;
+        assert_eq!(address_state(&feeds, &address), FeedState::Live);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        runtime.sweep_stale_datatypes();
+        assert_eq!(
+            address_state(&feeds, &address),
+            FeedState::Stale,
+            "silence after resumed data is still reported"
+        );
     }
 }

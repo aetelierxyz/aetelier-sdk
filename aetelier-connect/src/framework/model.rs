@@ -12,6 +12,8 @@ use aetelier_types::orderbooks::{NormalizedDelta, OrderbookDelta};
 use aetelier_types::trades::Trade;
 use aetelier_types::trading_pair::TradingPair;
 
+use super::slotbook::{SlotGap, SlotTick};
+
 /// The normalized, venue-agnostic market event the sync layer consumes. A
 /// normalizer returns a `Vec<DomainEvent>`, so a batched-trade frame yields
 /// one event per trade rather than dropping all but the head.
@@ -35,6 +37,13 @@ pub enum DomainEvent {
     FundingRate(aetelier_types::funding::FundingRate),
     OpenInterest(aetelier_types::open_interest::OpenInterest),
     FundingSettlement(aetelier_types::funding::FundingSettlement),
+    Transaction(Box<aetelier_types::onchain::Transaction>),
+    SlotTick(SlotTick),
+    SlotGap(SlotGap),
+    ConnectionLost {
+        reason: String,
+    },
+    ConnectionResumed,
 }
 
 impl DomainEvent {
@@ -73,7 +82,19 @@ impl DomainEvent {
                     fs.local_ts_us = local_us;
                 }
             }
-            DomainEvent::ConnectionGap { .. } => {}
+            DomainEvent::Transaction(tx) => {
+                if tx.local_tx_ts_us == 0 {
+                    tx.local_tx_ts_us = local_us;
+                    tx.source_tx_rtt_us = rtt_us;
+                    tx.recv_seq = recv_seq;
+                    tx.conn_epoch_us = conn_epoch_us;
+                }
+            }
+            DomainEvent::ConnectionGap { .. }
+            | DomainEvent::SlotTick(_)
+            | DomainEvent::SlotGap(_)
+            | DomainEvent::ConnectionLost { .. }
+            | DomainEvent::ConnectionResumed => {}
         }
     }
 }
@@ -161,9 +182,14 @@ pub enum ReconstructionModel {
         source: SnapshotSource,
     },
     /// Incremental deltas validated by a checksum (OKX/Kraken/Bitget).
-    ChecksumDelta { fmt: ChecksumFmt },
+    ChecksumDelta {
+        fmt: ChecksumFmt,
+    },
     /// Per-order (L3) book keyed by order id (Bitso `diff-orders`).
-    L3 { source: SnapshotSource },
+    L3 {
+        source: SnapshotSource,
+    },
+    Stream,
 }
 
 impl ReconstructionModel {
@@ -174,7 +200,8 @@ impl ReconstructionModel {
             ReconstructionModel::SeqDelta { source, .. }
             | ReconstructionModel::L3 { source } => Some(*source),
             ReconstructionModel::FullRefresh
-            | ReconstructionModel::ChecksumDelta { .. } => None,
+            | ReconstructionModel::ChecksumDelta { .. }
+            | ReconstructionModel::Stream => None,
         }
     }
 
@@ -186,13 +213,27 @@ impl ReconstructionModel {
             ReconstructionModel::SeqDelta { .. } => "seq_delta",
             ReconstructionModel::ChecksumDelta { .. } => "checksum_delta",
             ReconstructionModel::L3 { .. } => "l3",
+            ReconstructionModel::Stream => "stream",
         }
     }
 
     pub fn book_level(&self) -> &'static str {
         match self {
+            ReconstructionModel::FullRefresh
+            | ReconstructionModel::SeqDelta { .. }
+            | ReconstructionModel::ChecksumDelta { .. } => "L2",
             ReconstructionModel::L3 { .. } => "L3",
-            _ => "L2",
+            ReconstructionModel::Stream => "none",
+        }
+    }
+
+    pub fn reconstructs_books(&self) -> bool {
+        match self {
+            ReconstructionModel::FullRefresh
+            | ReconstructionModel::SeqDelta { .. }
+            | ReconstructionModel::ChecksumDelta { .. }
+            | ReconstructionModel::L3 { .. } => true,
+            ReconstructionModel::Stream => false,
         }
     }
 
@@ -436,6 +477,9 @@ impl SourcedOrderbook {
                 self.apply_checksummed(delta, fmt)
             }
             ReconstructionModel::L3 { .. } => self.apply_l3(delta),
+            ReconstructionModel::Stream => {
+                Err(self.gap("stream model reconstructs no order book"))
+            }
         }?;
         if let (Some((bid, _)), Some((ask, _))) =
             (self.book.best_bid(), self.book.best_ask())
@@ -1553,5 +1597,209 @@ mod tests {
         assert_eq!(t.apply(tr.clone(), Some(6)), TradeApply::Applied);
         assert_eq!(t.gap_events(), 1);
         assert_eq!(t.trades_lost(), 2);
+    }
+
+    fn released_row(tx_index: u64) -> aetelier_types::onchain::Transaction {
+        use crate::framework::onchain::decoded::fixtures::{decoded, key};
+        use crate::framework::onchain::{RowContext, WatchedAddress, transaction_rows};
+        use crate::framework::slotbook::BlockContext;
+        use aetelier_types::config::markets::market_config::TransactionsConfig;
+        let watched = WatchedAddress::new(key(3), &TransactionsConfig::default());
+        let block = BlockContext {
+            slot: 380_000_010,
+            block_height: 358_000_010,
+            block_time_us: 1_791_321_067_000_000,
+            blockhash: "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn",
+        };
+        let context = RowContext {
+            exchange: "solana",
+            commitment: aetelier_types::onchain::Commitment::Finalized,
+        };
+        transaction_rows(block, &decoded(tx_index), [&watched], context).remove(0)
+    }
+
+    #[test]
+    fn the_stream_model_has_no_book_seed_or_recovery_path() {
+        let stream = ReconstructionModel::Stream;
+        assert!(!stream.reconstructs_books());
+        assert_eq!(stream.class_label(), "stream");
+        assert_eq!(stream.book_level(), "none");
+        assert_eq!(stream.snapshot_source(), None);
+        assert!(!stream.needs_rest());
+        assert!(!stream.seeds_out_of_band());
+        assert!(!stream.supports_in_band_reseed());
+        assert!(!stream.replay_dedup_sound());
+        assert!(!stream.seq_is_connection_scoped());
+        assert!(matches!(
+            stream.recovery_action(),
+            RecoveryAction::Resubscribe
+        ));
+    }
+
+    #[test]
+    fn every_book_model_still_reconstructs_books() {
+        let models = [
+            (ReconstructionModel::FullRefresh, "L2"),
+            (
+                ReconstructionModel::SeqDelta {
+                    predicate: SeqPredicate::RangeInclusive,
+                    source: SnapshotSource::RestSnapshot,
+                },
+                "L2",
+            ),
+            (
+                ReconstructionModel::SeqDelta {
+                    predicate: SeqPredicate::ExactPrev,
+                    source: SnapshotSource::ReqOnSocket,
+                },
+                "L2",
+            ),
+            (
+                ReconstructionModel::SeqDelta {
+                    predicate: SeqPredicate::Monotonic,
+                    source: SnapshotSource::WssSelfSeed,
+                },
+                "L2",
+            ),
+            (
+                ReconstructionModel::ChecksumDelta {
+                    fmt: ChecksumFmt::OkxTop25,
+                },
+                "L2",
+            ),
+            (
+                ReconstructionModel::ChecksumDelta {
+                    fmt: ChecksumFmt::KrakenTop10,
+                },
+                "L2",
+            ),
+            (
+                ReconstructionModel::ChecksumDelta {
+                    fmt: ChecksumFmt::BitgetBidFirstTop25,
+                },
+                "L2",
+            ),
+            (
+                ReconstructionModel::L3 {
+                    source: SnapshotSource::RestSnapshot,
+                },
+                "L3",
+            ),
+        ];
+        for (model, level) in models {
+            assert!(model.reconstructs_books(), "{}", model.class_label());
+            assert_eq!(model.book_level(), level, "{}", model.class_label());
+        }
+        for (id, adapter) in crate::framework::registry::registry() {
+            let model = adapter.book_model("orders");
+            assert!(model.reconstructs_books(), "{id}");
+            assert_ne!(model.book_level(), "none", "{id}");
+        }
+    }
+
+    #[test]
+    fn a_stream_book_refuses_every_delta() {
+        let model = ReconstructionModel::Stream;
+        let mut book = SourcedOrderbook::new(
+            TradingPair::new("SOL", "USDC"),
+            model.clone(),
+            model.recovery_action(),
+        );
+        for (update_id, is_snapshot) in [(1, true), (2, false), (3, true)] {
+            let err = book
+                .apply(delta(
+                    "SOL/USDC",
+                    vec![("100", "1")],
+                    vec![("101", "1")],
+                    update_id,
+                    update_id,
+                    is_snapshot,
+                ))
+                .unwrap_err();
+            assert!(!err.reason.is_checksum());
+            assert_eq!(
+                err.reason.to_string(),
+                "stream model reconstructs no order book"
+            );
+            assert_eq!(book.state(), OrderBookState::Gapped);
+            assert_eq!(book.book().bid_depth() + book.book().ask_depth(), 0);
+        }
+    }
+
+    #[test]
+    fn a_transaction_is_stamped_once() {
+        let mut unstamped = released_row(0);
+        unstamped.local_tx_ts_us = 0;
+        unstamped.source_tx_rtt_us = 0;
+        unstamped.recv_seq = 0;
+        unstamped.conn_epoch_us = 0;
+        let mut ev = DomainEvent::Transaction(Box::new(unstamped.clone()));
+        ev.stamp_local(1_791_321_068_100_000, 900, 41, 1_791_321_000_000_000);
+        ev.stamp_local(1_791_321_069_100_000, 1_300, 42, 1_791_321_050_000_000);
+        match &ev {
+            DomainEvent::Transaction(tx) => {
+                assert_eq!(
+                    (
+                        tx.local_tx_ts_us,
+                        tx.source_tx_rtt_us,
+                        tx.recv_seq,
+                        tx.conn_epoch_us
+                    ),
+                    (1_791_321_068_100_000, 900, 41, 1_791_321_000_000_000)
+                );
+                assert_eq!(tx.source_tx_ts_us, unstamped.source_tx_ts_us);
+                assert_eq!(tx.signature, unstamped.signature);
+            }
+            other => panic!("expected a Transaction, got {other:?}"),
+        }
+
+        let received = released_row(1);
+        assert_ne!(received.local_tx_ts_us, 0);
+        let mut ev = DomainEvent::Transaction(Box::new(received.clone()));
+        ev.stamp_local(1_791_321_069_100_000, 1_300, 42, 1_791_321_050_000_000);
+        match ev {
+            DomainEvent::Transaction(tx) => assert_eq!(*tx, received),
+            other => panic!("expected a Transaction, got {other:?}"),
+        }
+
+        for mut control in [
+            DomainEvent::SlotTick(SlotTick {
+                slot: 380_000_010,
+                block_height: 358_000_010,
+                block_time_us: 1_791_321_067_000_000,
+            }),
+            DomainEvent::SlotGap(SlotGap {
+                prev_slot: 380_000_010,
+                prev_height: 358_000_010,
+                prev_block_time_us: 1_791_321_067_000_000,
+                next_slot: 380_000_014,
+                next_height: 358_000_013,
+                next_block_time_us: 1_791_321_069_000_000,
+            }),
+            DomainEvent::ConnectionLost {
+                reason: "stream reset".into(),
+            },
+            DomainEvent::ConnectionResumed,
+        ] {
+            let before = format!("{control:?}");
+            control.stamp_local(1_791_321_069_100_000, 1_300, 42, 1_791_321_050_000_000);
+            assert_eq!(format!("{control:?}"), before);
+        }
+    }
+
+    #[test]
+    fn a_transaction_event_is_boxed() {
+        use aetelier_types::onchain::Transaction;
+        assert!(std::mem::size_of::<DomainEvent>() < std::mem::size_of::<Transaction>());
+        assert!(
+            std::mem::size_of::<crate::framework::runtime::ReconstructedEvent>()
+                < std::mem::size_of::<Transaction>()
+        );
+        let row = released_row(2);
+        let ev = DomainEvent::Transaction(Box::new(row.clone()));
+        match ev {
+            DomainEvent::Transaction(boxed) => assert_eq!(*boxed, row),
+            other => panic!("expected a Transaction, got {other:?}"),
+        }
     }
 }

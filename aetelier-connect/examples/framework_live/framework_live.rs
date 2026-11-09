@@ -103,7 +103,12 @@ async fn main() -> anyhow::Result<()> {
             match ev {
                 ReconstructedEvent::FundingRate(_)
                 | ReconstructedEvent::OpenInterest(_)
-                | ReconstructedEvent::FundingSettlement(_) => {}
+                | ReconstructedEvent::FundingSettlement(_)
+                | ReconstructedEvent::Transaction(_)
+                | ReconstructedEvent::SlotTick(_)
+                | ReconstructedEvent::SlotGap(_)
+                | ReconstructedEvent::ConnectionLost { .. }
+                | ReconstructedEvent::ConnectionResumed => {}
                 ReconstructedEvent::Book { pair, ts_us, book } => {
                     book_updates += 1;
                     if last_print.elapsed() >= Duration::from_secs(1) {

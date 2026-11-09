@@ -309,12 +309,20 @@ impl FeedSet {
 
     /// Subscribe frames sent for this connection (initial or after reconnect).
     pub fn mark_all_subscribing(&mut self) {
-        self.each_live_mut(|f| f.to_subscribing());
+        self.each_live_mut(|f| {
+            if f.state() != FeedState::Subscribing {
+                f.to_subscribing();
+            }
+        });
     }
 
     /// The shared venue connection dropped; every non-terminal feed waits.
     pub fn mark_all_reconnecting(&mut self) {
-        self.each_live_mut(|f| f.to_reconnecting());
+        self.each_live_mut(|f| {
+            if f.state() != FeedState::Reconnecting {
+                f.to_reconnecting();
+            }
+        });
     }
 
     /// First data for `(instrument, datatype)` — its bound book is live.
@@ -562,6 +570,36 @@ mod tests {
         assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Rejected);
         assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Rejected);
         assert!(!fs.snapshot()[0].partial);
+    }
+
+    #[test]
+    fn set_wide_reconnect_and_subscribe_marks_are_idempotent() {
+        let pair = Instrument::from(TradingPair::new("BTC", "USDT"));
+        let mut fs = set();
+        let ids: Vec<String> = fs.snapshot().into_iter().map(|f| f.id).collect();
+        fs.mark_all_subscribing();
+        fs.mark_all_subscribing();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Subscribing);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Subscribing);
+        fs.mark_live(&pair, FeedDatatype::Orders);
+        fs.mark_all_reconnecting();
+        fs.mark_all_reconnecting();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Reconnecting);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Reconnecting);
+        fs.mark_all_subscribing();
+        fs.mark_all_subscribing();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Subscribing);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Subscribing);
+        fs.mark_live(&pair, FeedDatatype::Trades);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Live);
+        fs.mark_all_reconnecting();
+        fs.mark_all_failed("reconnect budget exhausted");
+        fs.mark_all_reconnecting();
+        fs.mark_all_subscribing();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Failed);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Failed);
+        let after: Vec<String> = fs.snapshot().into_iter().map(|f| f.id).collect();
+        assert_eq!(after, ids);
     }
 
     #[test]

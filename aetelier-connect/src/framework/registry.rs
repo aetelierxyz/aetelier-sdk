@@ -42,6 +42,12 @@ pub enum TaskExit {
     Exhausted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayFrame {
+    Update { t_us: u64, bytes: Vec<u8> },
+    Reconnect { t_us: u64 },
+}
+
 /// A venue's full integration behind the registry. Object-safe.
 pub trait ExchangeAdapter: Send + Sync + 'static {
     /// Stable venue id (`"binance"`, `"okx"`, …).
@@ -162,6 +168,22 @@ pub trait ExchangeAdapter: Send + Sync + 'static {
     ) -> Result<Vec<DomainEvent>, Box<crate::errors::ExchangeError>> {
         Err(Box::new(crate::errors::ExchangeError::Unsupported(
             format!("offline replay not implemented for venue '{}'", self.id()),
+        )))
+    }
+
+    fn replay_stream(
+        &self,
+        _symbols: &[String],
+        _datatypes: &aetelier_types::config::markets::market_config::DataTypesSection,
+        _commitment: aetelier_types::onchain::Commitment,
+        _frames: &[ReplayFrame],
+        _metrics: &SourceMetrics,
+    ) -> Result<Vec<DomainEvent>, Box<crate::errors::ExchangeError>> {
+        Err(Box::new(crate::errors::ExchangeError::Unsupported(
+            format!(
+                "offline stream replay not implemented for venue '{}'",
+                self.id()
+            ),
         )))
     }
 
@@ -585,5 +607,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn book_venues_refuse_stream_replay() {
+        use aetelier_types::config::markets::market_config::DataTypesSection;
+        use aetelier_types::onchain::Commitment;
+        let mut datatypes = DataTypesSection::default();
+        datatypes.transactions.enabled = true;
+        let frames = [
+            ReplayFrame::Update {
+                t_us: 1_791_321_067_000_000,
+                bytes: vec![0x0a, 0x00],
+            },
+            ReplayFrame::Reconnect {
+                t_us: 1_791_321_068_000_000,
+            },
+            ReplayFrame::Update {
+                t_us: 1_791_321_069_000_000,
+                bytes: Vec::new(),
+            },
+        ];
+        let metrics = SourceMetrics::default();
+        for (id, adapter) in registry() {
+            assert!(adapter.book_model("orders").reconstructs_books(), "{id}");
+            let err = adapter
+                .replay_stream(
+                    &["BTCUSDT".to_string()],
+                    &datatypes,
+                    Commitment::Finalized,
+                    &frames,
+                    &metrics,
+                )
+                .expect_err("a book venue has no stream replay");
+            match *err {
+                crate::errors::ExchangeError::Unsupported(reason) => assert_eq!(
+                    reason,
+                    format!("offline stream replay not implemented for venue '{id}'")
+                ),
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+        assert_eq!(metrics.snapshot(), SourceMetrics::default().snapshot());
     }
 }
