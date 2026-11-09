@@ -150,6 +150,25 @@ impl DataWorker {
     ) -> Result<Self, ConnectError> {
         let channel_capacity = config.common.channel_capacity();
         let core = IngestionCore::new(config.common.clone())?;
+        let exchange = core.exchange();
+        if exchange.chain().is_some() {
+            return Err(ConnectError::Build(format!(
+                "exchange = \"{exchange}\" runs only as a MarketWorker: add \
+                 [collect.sync] with sync_mode = \"on_slot\""
+            )));
+        }
+        if config.common.market_type == aetelier_types::exchanges::MarketType::Onchain {
+            return Err(ConnectError::Build(format!(
+                "exchange = \"{exchange}\" has no onchain market: set market_type \
+                 to \"spot\", \"perpetual\" or \"inverse\""
+            )));
+        }
+        if config.common.datatypes.transactions.enabled {
+            return Err(ConnectError::Build(format!(
+                "exchange = \"{exchange}\" has no transactions feed: disable \
+                 [collect.datatypes.transactions]"
+            )));
+        }
 
         let has_channel = config
             .output
@@ -353,11 +372,7 @@ impl DataWorker {
         let status_tx = self.status_tx;
 
         // Pipeline: passthrough for most exchanges, BookInitializer for Binance.
-        let exchange_enum: aetelier_types::exchanges::Exchange = self
-            .core
-            .exchange_name()
-            .parse()
-            .unwrap_or(aetelier_types::exchanges::Exchange::Bybit);
+        let exchange_enum: aetelier_types::exchanges::Exchange = self.core.exchange();
         let datatypes = self.core.datatypes().clone();
         let symbol = self.core.symbol().to_string();
         let pair = aetelier_types::trading_pair::TradingPair::from_exchange_symbol(
@@ -365,7 +380,6 @@ impl DataWorker {
             exchange_enum,
         )
         .expect("valid exchange symbol");
-        let exchange_name = self.core.exchange_name().to_string();
 
         // Snapshot initial status fields for periodic updates (before moving self).
         let initial_datatypes = datatypes.enabled_names();
@@ -475,10 +489,8 @@ impl DataWorker {
                         let id_str = tx.borrow().id;
                         let _ = tx.send(WorkerStatus {
                             id: id_str,
-                            exchange: exchange_name.parse().unwrap_or(
-                                aetelier_types::exchanges::Exchange::Bybit,
-                            ),
-                            pair: pair.clone(),
+                            exchange: exchange_enum,
+                            pair: pair.clone().into(),
                             market_type: initial_market_type,
                             mode: WorkerMode::Raw,
                             connection_state,
@@ -573,7 +585,7 @@ impl DataWorker {
             .enabled
             .then(|| format!("open_interest.all.{}", symbol));
 
-        let exchange_enum: Exchange = exchange_name.parse().unwrap_or(Exchange::Bybit);
+        let exchange_enum: Exchange = self.core.exchange();
         let initial_datatypes = datatypes.enabled_names();
         let (initial_market_type, initial_sinks) = status_tx
             .as_ref()
@@ -738,7 +750,7 @@ impl DataWorker {
                             let _ = tx.send(WorkerStatus {
                                 id: id_str,
                                 exchange: exchange_enum,
-                                pair: pair.clone(),
+                                pair: pair.clone().into(),
                                 market_type: initial_market_type,
                                 mode: WorkerMode::Raw,
                                 connection_state,
@@ -947,5 +959,56 @@ symbol = "BTCUSDT"
             .unwrap();
         let w = DataWorker::from_config(c).unwrap();
         assert!(!w.use_framework_path());
+    }
+
+    #[test]
+    fn ingestion_core_reports_the_parsed_exchange() {
+        use aetelier_types::exchanges::Exchange;
+        let cex = Exchange::all()
+            .into_iter()
+            .filter(|e| e.chain().is_none())
+            .map(|e| (e.to_string(), e));
+        for (name, expected) in cex.chain([("huobi".to_string(), Exchange::Htx)]) {
+            let w = DataWorker::from_config(cfg(&name, false)).unwrap();
+            assert_eq!(w.core.exchange(), expected, "{name}");
+            assert_eq!(w.core.exchange_name(), name);
+        }
+    }
+
+    #[test]
+    fn data_worker_refuses_a_chain_venue() {
+        for framework in [true, false] {
+            let err = match DataWorker::from_config(cfg("solana", framework)) {
+                Ok(_) => panic!("a chain venue must not build a DataWorker"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("MarketWorker"), "{err}");
+        }
+    }
+
+    #[test]
+    fn data_worker_refuses_declared_transactions_on_a_cex_venue() {
+        for framework in [true, false] {
+            let mut config = cfg("bybit", framework);
+            config.common.datatypes.transactions.enabled = true;
+            let err = match DataWorker::from_config(config) {
+                Ok(_) => panic!("transactions must not build on a CEX venue"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("transactions"), "{err}");
+        }
+    }
+
+    #[test]
+    fn data_worker_refuses_onchain_on_a_cex_venue() {
+        for framework in [true, false] {
+            let mut config = cfg("bybit", framework);
+            config.common.market_type = aetelier_types::exchanges::MarketType::Onchain;
+            let err = match DataWorker::from_config(config) {
+                Ok(_) => panic!("market_type onchain must not build on a CEX venue"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("market_type"), "{err}");
+        }
     }
 }

@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use aetelier_types::config::markets::market_config::DeclaredDatatype;
 use aetelier_types::exchanges::Exchange;
 use aetelier_types::trading_pair::TradingPair;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,28 @@ pub enum FeedDatatype {
     Trades,
     FundingRates,
     OpenInterest,
+    Transactions,
+}
+
+impl FeedDatatype {
+    pub const ALL: [FeedDatatype; 5] = [
+        FeedDatatype::Orders,
+        FeedDatatype::Trades,
+        FeedDatatype::FundingRates,
+        FeedDatatype::OpenInterest,
+        FeedDatatype::Transactions,
+    ];
+
+    pub const fn for_declared(declared: DeclaredDatatype) -> Option<FeedDatatype> {
+        match declared {
+            DeclaredDatatype::Orderbook => Some(FeedDatatype::Orders),
+            DeclaredDatatype::Trades => Some(FeedDatatype::Trades),
+            DeclaredDatatype::Liquidations => None,
+            DeclaredDatatype::FundingRates => Some(FeedDatatype::FundingRates),
+            DeclaredDatatype::OpenInterest => Some(FeedDatatype::OpenInterest),
+            DeclaredDatatype::Transactions => Some(FeedDatatype::Transactions),
+        }
+    }
 }
 
 /// `Feed` lifecycle state. `Closed`/`Rejected`/`Failed` are terminal.
@@ -599,5 +622,89 @@ mod tests {
         fs.mark_all_closed(true);
         assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Closed);
         assert!(fs.snapshot().iter().all(|f| f.partial));
+    }
+
+    #[test]
+    fn feed_datatype_wire_names_are_the_variant_names() {
+        let wire: Vec<String> = FeedDatatype::ALL
+            .iter()
+            .map(|dt| serde_json::to_string(dt).unwrap())
+            .collect();
+        assert_eq!(
+            wire,
+            [
+                "\"Orders\"",
+                "\"Trades\"",
+                "\"FundingRates\"",
+                "\"OpenInterest\"",
+                "\"Transactions\"",
+            ]
+        );
+        for (dt, json) in FeedDatatype::ALL.into_iter().zip(&wire) {
+            assert_eq!(serde_json::from_str::<FeedDatatype>(json).unwrap(), dt);
+        }
+    }
+
+    #[test]
+    fn declared_datatypes_map_to_feeds_and_liquidations_stay_feedless() {
+        let expected = [
+            (DeclaredDatatype::Orderbook, Some(FeedDatatype::Orders)),
+            (DeclaredDatatype::Trades, Some(FeedDatatype::Trades)),
+            (DeclaredDatatype::Liquidations, None),
+            (
+                DeclaredDatatype::FundingRates,
+                Some(FeedDatatype::FundingRates),
+            ),
+            (
+                DeclaredDatatype::OpenInterest,
+                Some(FeedDatatype::OpenInterest),
+            ),
+            (
+                DeclaredDatatype::Transactions,
+                Some(FeedDatatype::Transactions),
+            ),
+        ];
+        assert_eq!(expected.len(), DeclaredDatatype::ALL.len());
+        for (declared, feed) in expected {
+            assert_eq!(FeedDatatype::for_declared(declared), feed, "{declared:?}");
+        }
+    }
+
+    #[test]
+    fn cex_feed_list_is_unchanged() {
+        use aetelier_types::config::markets::market_config::DataTypesSection;
+        let section: DataTypesSection = toml::from_str(
+            r#"
+[orderbook]
+enabled = true
+
+[trades]
+enabled = true
+
+[liquidations]
+enabled = true
+
+[funding_rates]
+enabled = true
+
+[open_interest]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let feeds: Vec<FeedDatatype> = section
+            .declared_set()
+            .iter()
+            .filter_map(FeedDatatype::for_declared)
+            .collect();
+        assert_eq!(
+            feeds,
+            [
+                FeedDatatype::Orders,
+                FeedDatatype::Trades,
+                FeedDatatype::FundingRates,
+                FeedDatatype::OpenInterest,
+            ]
+        );
     }
 }

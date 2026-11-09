@@ -165,6 +165,10 @@ impl IngestionCore {
         &self.common.exchange
     }
 
+    pub fn exchange(&self) -> Exchange {
+        self.exchange
+    }
+
     /// The symbol this core collects.
     pub fn symbol(&self) -> &str {
         &self.common.symbol

@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let manifest = MarketWorkerManifest::from_toml(&cli.config)?;
-    let configs = manifest.resolve_all();
+    let configs = manifest.resolve_admitted()?;
 
     if configs.is_empty() {
         anyhow::bail!("manifest contains no worker entries");

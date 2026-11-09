@@ -33,7 +33,6 @@ use crate::config::workers::{MarketWorkerConfig, OutputSinkConfig};
 use crate::errors::ConnectError;
 use crate::sources::ExchangeEvent;
 use crate::synchronizers::{ClockMode, MarketSynchronizer};
-use aetelier_types::config::markets::market_config::SyncMode;
 use aetelier_types::exchanges::Exchange;
 use aetelier_types::levels::Level;
 use aetelier_types::orders::OrderSide;
@@ -197,12 +196,7 @@ impl MarketWorker {
         flush_cb: Option<BufferedSinkFlushCallback>,
     ) -> Result<Self, ConnectError> {
         let period_us = config.sync.period_us();
-        let clock_mode = match config.sync.sync_mode {
-            SyncMode::OnOrderbook => ClockMode::OrderbookDriven,
-            SyncMode::OnTrade => ClockMode::TradeDriven,
-            SyncMode::OnLiquidation => ClockMode::LiquidationDriven,
-            SyncMode::OnTime => ClockMode::ExternalClock,
-        };
+        let clock_mode = config.sync.sync_mode.clock_mode();
         let mut sync = MarketSynchronizer::with_clock_mode(period_us, clock_mode);
         let flush_threshold = config.sync.flush_threshold;
         let framework_ingest = config.framework_ingest;
@@ -217,6 +211,7 @@ impl MarketWorker {
                     .to_string(),
             ));
         }
+        config.admit()?;
 
         // Live reconciliation is gated to the synchronized path at cadence
         // ≥ 50ms (below that the hold-back buffers too many periods to be
@@ -251,6 +246,17 @@ impl MarketWorker {
             sync.set_emission_delay_us(r.emission_delay_us());
         } else if let Some(w) = &config.emission_delay {
             sync.set_emission_delay_us(w.as_micros());
+        } else if let Some(us) = config
+            .common
+            .exchange
+            .parse::<aetelier_types::exchanges::Exchange>()
+            .ok()
+            .and_then(|exchange| {
+                crate::framework::registry::admit_registered(exchange).ok()
+            })
+            .and_then(|adapter| adapter.default_emission_delay_us())
+        {
+            sync.set_emission_delay_us(us);
         }
 
         let channel_capacity = config.common.channel_capacity();
@@ -392,9 +398,7 @@ impl MarketWorker {
         self,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<MarketWorkerReport> {
-        if self.transport
-            == crate::config::workers::market_worker_config::TransportKind::Entrepot
-        {
+        if self.transport.forces_framework() {
             return self.run_framework(shutdown).await;
         }
         if self.framework_ingest
@@ -475,9 +479,7 @@ impl MarketWorker {
             .unwrap_or_default();
 
         // Pipeline: passthrough for most exchanges, BookInitializer for Binance.
-        let exchange_enum: aetelier_types::exchanges::Exchange = exchange_name
-            .parse()
-            .unwrap_or(aetelier_types::exchanges::Exchange::Bybit);
+        let exchange_enum: Exchange = core.exchange();
         let pair = TradingPair::from_exchange_symbol(&symbol, exchange_enum).ok_or_else(
             || {
                 anyhow::anyhow!(
@@ -601,7 +603,7 @@ impl MarketWorker {
                             let _ = tx.send(WorkerStatus {
                                 id: id_str,
                                 exchange: exchange_enum,
-                                pair: pair.clone(),
+                                pair: pair.clone().into(),
                                 market_type: initial_market_type,
                                 mode: WorkerMode::Clock {
                                     clock: clock_mode,
@@ -685,7 +687,7 @@ impl MarketWorker {
                             let _ = tx.send(WorkerStatus {
                                 id: id_str,
                                 exchange: exchange_enum,
-                                pair: pair.clone(),
+                                pair: pair.clone().into(),
                                 market_type: initial_market_type,
                                 mode: WorkerMode::Clock {
                                     clock: clock_mode,
@@ -844,6 +846,10 @@ impl MarketWorker {
                         })?,
                     )
                 }
+                TransportKind::Grpc => anyhow::bail!(
+                    "transport = \"grpc\" needs the `grpc` feature: this build has no gRPC \
+                     transport"
+                ),
             };
         let adapter: &dyn crate::framework::registry::ExchangeAdapter =
             match owned_adapter.as_deref() {
@@ -895,22 +901,18 @@ impl MarketWorker {
         }
         let recovery = model.recovery_action();
 
-        let exchange_enum: Exchange = exchange_name.parse().unwrap_or(Exchange::Binance);
+        let exchange_enum: Exchange = core.exchange();
         let initial_datatypes = core.datatypes().enabled_names();
         // One Feed per (instrument, datatype) this worker subscribes; owned
         // here so FeedIds survive socket reconnects. Liquidations remain on
         // the legacy path and enter the feed taxonomy when ported.
         let feeds = {
             use crate::framework::feed::{Feed, FeedDatatype, FeedSet};
-            let list: Vec<Feed> = initial_datatypes
+            let list: Vec<Feed> = core
+                .datatypes()
+                .declared_set()
                 .iter()
-                .filter_map(|name| match name.as_str() {
-                    "orderbook" => Some(FeedDatatype::Orders),
-                    "trades" => Some(FeedDatatype::Trades),
-                    "funding_rates" => Some(FeedDatatype::FundingRates),
-                    "open_interest" => Some(FeedDatatype::OpenInterest),
-                    _ => None,
-                })
+                .filter_map(FeedDatatype::for_declared)
                 .map(|dt| Feed::new(exchange_enum, pair.clone(), dt))
                 .collect();
             FeedSet::new(list).into_shared()
@@ -1081,15 +1083,10 @@ impl MarketWorker {
         let declared_cadences: Vec<(
             crate::framework::feed::FeedDatatype,
             std::time::Duration,
-        )> = [
-            crate::framework::feed::FeedDatatype::Orders,
-            crate::framework::feed::FeedDatatype::Trades,
-            crate::framework::feed::FeedDatatype::FundingRates,
-            crate::framework::feed::FeedDatatype::OpenInterest,
-        ]
-        .into_iter()
-        .filter_map(|dt| adapter.datatype_cadence(dt).map(|c| (dt, c)))
-        .collect();
+        )> = crate::framework::feed::FeedDatatype::ALL
+            .into_iter()
+            .filter_map(|dt| adapter.datatype_cadence(dt).map(|c| (dt, c)))
+            .collect();
         // fresh subscribe re-seeds. Shutdown / `Stop` exits.
         while !stopped && !*shutdown.borrow() {
             // Ingest: adapter -> DomainEvent. Sync: DomainEvent -> ReconstructedEvent.
@@ -1403,7 +1400,7 @@ impl MarketWorker {
                             let _ = tx.send(WorkerStatus {
                                 id: id_str,
                                 exchange: exchange_enum,
-                                pair: pair.clone(),
+                                pair: pair.clone().into(),
                                 market_type: initial_market_type,
                                 mode: WorkerMode::Clock {
                                     clock: clock_mode,
@@ -1573,7 +1570,7 @@ impl MarketWorker {
             let _ = tx.send(WorkerStatus {
                 id: id_str,
                 exchange: exchange_enum,
-                pair: pair.clone(),
+                pair: pair.clone().into(),
                 market_type: initial_market_type,
                 mode: WorkerMode::Clock {
                     clock: clock_mode,
@@ -2554,6 +2551,89 @@ symbol = "BTCUSDT"
         let cfg = resolve_hold_back(&hold_back_manifest(None, true));
         let w = MarketWorker::from_config(cfg).unwrap();
         assert_eq!(w.sync.emission_delay_us(), 1_000_000);
+    }
+
+    const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+
+    fn build_error(toml: &str) -> String {
+        let cfg = crate::config::workers::MarketWorkerManifest::from_str(toml)
+            .unwrap()
+            .resolve_all()
+            .remove(0);
+        match MarketWorker::from_config(cfg) {
+            Ok(_) => panic!("the worker must not build"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn grpc_transport_on_a_cex_venue_names_the_chain_venue() {
+        let toml = r#"
+[collect]
+exchange = "bybit"
+transport = "grpc"
+
+[collect.datatypes.trades]
+enabled = true
+
+[collect.sync]
+sync_mode = "on_trade"
+flush_threshold = 600
+
+[collect.sync.update_frequency]
+value = 100
+unit = "Millis"
+
+[[workers]]
+symbol = "BTCUSDT"
+"#;
+        assert_eq!(
+            build_error(toml),
+            "worker build failed: transport = \"grpc\" is only available for exchange = \"solana\""
+        );
+    }
+
+    #[test]
+    fn from_config_full_runs_admission() {
+        let onchain = hold_back_manifest(None, false).replace(
+            "exchange = \"binance\"",
+            "exchange = \"bybit\"\nmarket_type = \"onchain\"",
+        );
+        assert_eq!(
+            build_error(&onchain),
+            "worker build failed: venue 'bybit' has no onchain market — set \
+             `market_type` to \"spot\", \"perpetual\" or \"inverse\""
+        );
+        let solana = format!(
+            r#"
+[collect]
+exchange = "solana"
+market_type = "onchain"
+transport = "grpc"
+
+[collect.grpc]
+endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
+
+[collect.datatypes.transactions]
+enabled = true
+
+[collect.sync]
+sync_mode = "on_slot"
+flush_threshold = 60
+
+[collect.sync.update_frequency]
+value = 1
+unit = "Secs"
+
+[[workers]]
+symbol = "{JUPITER_V6}"
+"#
+        );
+        assert_eq!(
+            build_error(&solana),
+            "worker build failed: venue 'solana' needs the `grpc` feature: this build \
+             registers no solana adapter"
+        );
     }
 
     #[test]

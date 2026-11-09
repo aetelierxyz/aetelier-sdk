@@ -13,6 +13,19 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `aetelier_types::onchain`: `Chain`, `ChainAddress` (case-preserving base58, validated to 32 bytes), `Instrument`, and the `Transaction` record with `MatchRole`, `Commitment`, `TransactionVersion` (`legacy`, `v0`, `v1`) and `TransactionFailure`. `DeclaredDatatype::Transactions`, the `[datatypes.transactions]` feed (`enabled`, `match`, `include_failed`, `logs`) and `MarketSnapshot.transactions`.
 - `aetelier_io::onchain`: the `transactions.v1` Parquet writer and reader (file tag `txs`, leaf `transactions`), its schema fingerprint, and `check_transactions`.
 - `validate` T11–T13: unique `(address, signature)` per file, `(slot, tx_index)` order per address, block context and row invariants. T01 expects `transactions` for `solana` and `orderbooks` + `trades` elsewhere.
+- `Exchange::Solana` (`solana`, no alias) and `MarketType::Onchain` (`onchain`); `Exchange::chain()` names a venue's chain. `Instrument` serializes as `BASE/QUOTE` or bare base58 and parses by the slash; `Instrument::from_exchange_symbol` decodes per venue.
+- `SymbolCodec::ChainAddress` and `SymbolCodec::decode_instrument`; `FeedDatatype::Transactions` with `FeedDatatype::ALL` and `FeedDatatype::for_declared`.
+- `SyncMode::OnSlot` (`on_slot`) and `ClockMode::SlotDriven` (label `ON_SLOT`); `SyncMode::clock_mode`, `WorkerStatus::initial` and `IngestionCore::exchange`.
+- `transport = "grpc"` with a strict `[collect.grpc]` section (`GrpcSection`: endpoint, token env, commitment, filter and size limits).
+- Admission: `ExchangeAdapter::supported_market_types`, `ExchangeAdapter::default_emission_delay_us`, `admit_market_type`, `admit_datatypes`, `admit_registered`, `MarketWorkerConfig::admit` and `MarketWorkerManifest::resolve_admitted`.
+
+### Changed
+
+- `WorkerStatus.pair` is an `Instrument`; CEX status JSON is unchanged.
+- `md_worker` admits every worker before starting any.
+- `MarketWorker` refuses `transport = "grpc"`, `sync_mode = "on_slot"`, `market_type = "onchain"` and `[collect.datatypes.transactions]` on CEX venues. A `solana` worker needs `transport = "grpc"`, a valid `[collect.grpc]`, a base58 address, `sync_mode = "on_slot"`, no enabled `[collect.reconcile]` and a declared datatype, and fails naming the `grpc` feature while no solana adapter is built in.
+- `DataWorker` refuses chain venues, `market_type = "onchain"` and `[collect.datatypes.transactions]`.
+- `[collect.datatypes.transactions]` rejects unknown keys; a manifest with a chain venue rejects duplicate addresses and unread keys under `[collect.sync]` and `[[workers]]`.
 
 ### Fixed
 

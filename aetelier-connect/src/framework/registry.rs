@@ -71,6 +71,15 @@ pub trait ExchangeAdapter: Send + Sync + 'static {
         &[DD::Orderbook, DD::Trades]
     }
 
+    fn supported_market_types(&self) -> &'static [aetelier_types::exchanges::MarketType] {
+        use aetelier_types::exchanges::MarketType as MT;
+        &[MT::Spot, MT::Perpetual, MT::Inverse]
+    }
+
+    fn default_emission_delay_us(&self) -> Option<u64> {
+        None
+    }
+
     fn resubscribe_replays_trades(&self) -> bool {
         false
     }
@@ -259,6 +268,80 @@ pub fn admit_environment(
     ))
 }
 
+pub fn admit_market_type(
+    venue: &str,
+    supported: &[aetelier_types::exchanges::MarketType],
+    market_type: aetelier_types::exchanges::MarketType,
+) -> Result<(), String> {
+    if supported.contains(&market_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "venue '{venue}' has no {market_type} market — set `market_type` to {}",
+        quoted_choices(supported)
+    ))
+}
+
+pub fn admit_datatypes(
+    exchange: aetelier_types::exchanges::Exchange,
+    supported: &[aetelier_types::config::markets::market_config::DeclaredDatatype],
+    declared: &aetelier_types::config::markets::market_config::DeclaredSet,
+) -> Result<(), String> {
+    use aetelier_types::config::markets::market_config::DeclaredDatatype as DD;
+    if exchange.chain().is_none() {
+        if declared.contains(DD::Transactions) && !supported.contains(&DD::Transactions) {
+            return Err(format!(
+                "venue '{exchange}' delivers no transactions — remove \
+                 `[collect.datatypes.transactions]` or set `enabled = false` there"
+            ));
+        }
+        return Ok(());
+    }
+    let ids: Vec<&str> = supported.iter().map(|dt| dt.id()).collect();
+    if declared.is_empty() {
+        return Err(format!(
+            "venue '{exchange}' declares no datatype — enable {}",
+            quoted_choices(&ids)
+        ));
+    }
+    match declared.iter().find(|dt| !supported.contains(dt)) {
+        Some(dt) => Err(format!(
+            "venue '{exchange}' delivers no {} — enable only {}",
+            dt.id(),
+            quoted_choices(&ids)
+        )),
+        None => Ok(()),
+    }
+}
+
+pub fn admit_registered(
+    exchange: aetelier_types::exchanges::Exchange,
+) -> Result<&'static dyn ExchangeAdapter, String> {
+    if let Some(adapter) = registry().get(exchange.to_string().as_str()) {
+        return Ok(*adapter);
+    }
+    match exchange.chain() {
+        Some(_) => Err(format!(
+            "venue '{exchange}' needs the `grpc` feature: this build registers no \
+             {exchange} adapter"
+        )),
+        None => Err(format!(
+            "venue '{exchange}' has no adapter registered in this build"
+        )),
+    }
+}
+
+fn quoted_choices<T: std::fmt::Display>(items: &[T]) -> String {
+    let quoted: Vec<String> = items.iter().map(|item| format!("\"{item}\"")).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => {
+            format!("{} or {last}", rest.join(", "))
+        }
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +433,157 @@ mod tests {
     fn resolve_reports_unknown_venues() {
         let err = resolve(&["binance", "ftx"]).unwrap_err();
         assert_eq!(err, vec!["ftx".to_string()]);
+    }
+
+    #[test]
+    fn only_chain_venues_carry_the_chain_address_codec() {
+        use aetelier_types::exchanges::Exchange;
+        for (id, adapter) in registry() {
+            let exchange: Exchange = id.parse().unwrap();
+            let codec = &adapter.profile().symbol_codec;
+            match exchange.chain() {
+                Some(chain) => assert!(
+                    matches!(codec, SymbolCodec::ChainAddress { chain: c } if *c == chain),
+                    "{id} must decode {chain} addresses, not {codec:?}"
+                ),
+                None => assert!(
+                    !matches!(codec, SymbolCodec::ChainAddress { .. }),
+                    "{id} is not a chain venue but carries {codec:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn admit_market_type_names_the_supported_set() {
+        use aetelier_types::exchanges::MarketType as MT;
+        let cex = [MT::Spot, MT::Perpetual, MT::Inverse];
+        assert!(admit_market_type("bybit", &cex, MT::Perpetual).is_ok());
+        let err = admit_market_type("bybit", &cex, MT::Onchain).unwrap_err();
+        assert_eq!(
+            err,
+            "venue 'bybit' has no onchain market — set `market_type` to \"spot\", \
+             \"perpetual\" or \"inverse\""
+        );
+        assert!(admit_market_type("solana", &[MT::Onchain], MT::Onchain).is_ok());
+        let err = admit_market_type("solana", &[MT::Onchain], MT::Spot).unwrap_err();
+        assert_eq!(
+            err,
+            "venue 'solana' has no spot market — set `market_type` to \"onchain\""
+        );
+    }
+
+    #[test]
+    fn every_cex_adapter_admits_spot_perpetual_inverse_and_refuses_onchain() {
+        use aetelier_types::exchanges::{Exchange, MarketType as MT};
+        for (id, adapter) in registry() {
+            let exchange: Exchange = id.parse().unwrap();
+            if exchange.chain().is_some() {
+                continue;
+            }
+            let supported = adapter.supported_market_types();
+            for market_type in [MT::Spot, MT::Perpetual, MT::Inverse] {
+                assert!(
+                    admit_market_type(id, supported, market_type).is_ok(),
+                    "{id} must admit {market_type}"
+                );
+            }
+            assert!(
+                admit_market_type(id, supported, MT::Onchain).is_err(),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn admit_datatypes_keeps_the_cex_derivative_fallback_and_refuses_transactions() {
+        use aetelier_types::config::markets::market_config::{
+            DataTypesSection, DeclaredDatatype as DD,
+        };
+        use aetelier_types::exchanges::Exchange;
+        let bybit = registry().get("bybit").copied().unwrap();
+        let supported = bybit.supported_datatypes();
+        assert!(!supported.contains(&DD::Liquidations));
+        let mut section = DataTypesSection::default();
+        section.orderbook.enabled = true;
+        section.trades.enabled = true;
+        section.liquidations.enabled = true;
+        assert!(
+            admit_datatypes(Exchange::Bybit, supported, &section.declared_set()).is_ok()
+        );
+        section.transactions.enabled = true;
+        let err = admit_datatypes(Exchange::Bybit, supported, &section.declared_set())
+            .unwrap_err();
+        assert!(
+            err.contains("bybit") && err.contains("transactions"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn admit_datatypes_on_a_chain_venue_requires_a_non_empty_subset() {
+        use aetelier_types::config::markets::market_config::{
+            DataTypesSection, DeclaredDatatype as DD, DeclaredSet,
+        };
+        use aetelier_types::exchanges::Exchange;
+        let supported = [DD::Transactions];
+        let only_transactions = DeclaredSet::only(DD::Transactions);
+        assert!(
+            admit_datatypes(Exchange::Solana, &supported, &only_transactions).is_ok()
+        );
+        let err = admit_datatypes(Exchange::Solana, &supported, &DeclaredSet::default())
+            .unwrap_err();
+        assert!(
+            err.contains("declares no datatype") && err.contains("\"transactions\""),
+            "{err}"
+        );
+        let mut section = DataTypesSection::default();
+        section.transactions.enabled = true;
+        section.orderbook.enabled = true;
+        let err = admit_datatypes(Exchange::Solana, &supported, &section.declared_set())
+            .unwrap_err();
+        assert!(err.contains("delivers no orderbook"), "{err}");
+    }
+
+    #[test]
+    fn admit_registered_names_the_grpc_feature_for_solana() {
+        use aetelier_types::exchanges::Exchange;
+        let err = admit_registered(Exchange::Solana)
+            .err()
+            .expect("this build registers no solana adapter");
+        assert_eq!(
+            err,
+            "venue 'solana' needs the `grpc` feature: this build registers no solana \
+             adapter"
+        );
+        for exchange in Exchange::all().into_iter().filter(|e| e.chain().is_none()) {
+            match admit_registered(exchange) {
+                Ok(adapter) => assert_eq!(adapter.id(), exchange.to_string()),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_cex_adapter_sets_a_default_emission_delay() {
+        for (id, adapter) in registry() {
+            assert_eq!(adapter.default_emission_delay_us(), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn no_cex_adapter_declares_a_transactions_cadence() {
+        use crate::framework::feed::FeedDatatype;
+        use aetelier_types::exchanges::Exchange;
+        for (id, adapter) in registry() {
+            let exchange: Exchange = id.parse().unwrap();
+            if exchange.chain().is_none() {
+                assert_eq!(
+                    adapter.datatype_cadence(FeedDatatype::Transactions),
+                    None,
+                    "{id}"
+                );
+            }
+        }
     }
 }

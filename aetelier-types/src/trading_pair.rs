@@ -130,6 +130,7 @@ impl TradingPair {
             }
             Exchange::Upbit => Self::from_quote_first_hyphen(raw),
             Exchange::Hyperliquid => Self::from_bare_coin(raw),
+            Exchange::Solana => None,
         }
     }
 
@@ -248,6 +249,7 @@ impl TradingPair {
             // Upbit lists the quote currency first (`KRW-BTC`).
             Exchange::Upbit => format!("{}-{}", self.quote, self.base),
             Exchange::Hyperliquid => self.base.clone(),
+            Exchange::Solana => self.to_canonical(),
         }
     }
 
@@ -757,6 +759,31 @@ mod tests {
         assert_eq!(
             TradingPair::from_exchange_symbol(&wire, Exchange::Bitso).unwrap(),
             bitso
+        );
+    }
+
+    #[test]
+    fn from_exchange_symbol_never_parses_on_solana() {
+        for raw in [
+            "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+            "SOLUSDT",
+            "SOL/USDC",
+        ] {
+            assert_eq!(
+                TradingPair::from_exchange_symbol(raw, Exchange::Solana),
+                None,
+                "{raw:?} must not become a pair"
+            );
+        }
+    }
+
+    #[test]
+    fn to_exchange_symbol_on_solana_is_the_canonical_pair() {
+        let pair = TradingPair::new("SOL", "USDC");
+        assert_eq!(pair.to_exchange_symbol(Exchange::Solana), "SOL/USDC");
+        assert_eq!(
+            pair.to_exchange_symbol(Exchange::Solana),
+            pair.to_canonical()
         );
     }
 }

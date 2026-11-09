@@ -3,7 +3,7 @@ mod tests {
     use aetelier_types::config::markets::market_config::{
         MarketSnapshotConfig, OrderbookConfig, SyncMode, TimeUnit,
     };
-    use aetelier_types::synchronizers::ClockMode;
+    use aetelier_types::synchronizers::{ClockMode, WorkerMode};
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Test 1: Full TOML roundtrip
@@ -364,6 +364,108 @@ dir = "test"
         let config: MarketSnapshotConfig =
             toml::from_str(toml_str).expect("failed to deserialize");
         assert_eq!(config.clock_mode(), ClockMode::ExternalClock);
+    }
+
+    #[test]
+    fn sync_mode_clock_mode_matches_the_config_mapping() {
+        for mode in [
+            SyncMode::OnOrderbook,
+            SyncMode::OnTrade,
+            SyncMode::OnLiquidation,
+            SyncMode::OnTime,
+        ] {
+            let toml_str = format!(
+                r#"
+[exchange]
+name = "bybit"
+
+[symbol]
+name = "BTCUSDT"
+sync_mode = "{mode}"
+
+[update_frequency]
+value = 100
+unit = "Millis"
+
+[pipeline]
+flush_threshold = 100
+
+[output]
+dir = "test"
+"#
+            );
+
+            let config: MarketSnapshotConfig =
+                toml::from_str(&toml_str).expect("failed to deserialize");
+            assert_eq!(config.symbol.sync_mode, mode);
+            assert_eq!(mode.clock_mode(), config.clock_mode(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn on_slot_parses_displays_and_maps_to_slot_driven() {
+        let toml_str = r#"
+[exchange]
+name = "solana"
+
+[symbol]
+name = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+sync_mode = "on_slot"
+
+[update_frequency]
+value = 1
+unit = "Secs"
+
+[pipeline]
+flush_threshold = 60
+
+[output]
+dir = "test"
+"#;
+
+        let config: MarketSnapshotConfig =
+            toml::from_str(toml_str).expect("failed to deserialize");
+        assert_eq!(config.symbol.sync_mode, SyncMode::OnSlot);
+        assert_eq!(SyncMode::OnSlot.to_string(), "on_slot");
+        assert_eq!(SyncMode::OnSlot.clock_mode(), ClockMode::SlotDriven);
+        assert_eq!(config.clock_mode(), ClockMode::SlotDriven);
+        assert_eq!(config.clock_mode_label(), "ClockMode::SlotDriven");
+    }
+
+    #[test]
+    fn clock_labels_for_existing_modes_are_unchanged() {
+        let label = |clock: ClockMode, period_us: u64| {
+            WorkerMode::Clock { clock, period_us }.to_string()
+        };
+        assert_eq!(WorkerMode::Raw.to_string(), "RAW");
+        assert_eq!(label(ClockMode::OrderbookDriven, 100_000), "ON_ORDERBOOK");
+        assert_eq!(label(ClockMode::TradeDriven, 100_000), "ON_TRADE");
+        assert_eq!(
+            label(ClockMode::LiquidationDriven, 100_000),
+            "ON_LIQUIDATION"
+        );
+        assert_eq!(label(ClockMode::ExternalClock, 1_000_000), "ON_CLOCK(1S)");
+        assert_eq!(label(ClockMode::ExternalClock, 100_000), "ON_CLOCK(100MS)");
+        assert_eq!(label(ClockMode::ExternalClock, 250), "ON_CLOCK(250US)");
+    }
+
+    #[test]
+    fn slot_driven_label_is_on_slot() {
+        let slot = WorkerMode::Clock {
+            clock: ClockMode::SlotDriven,
+            period_us: 1_000_000,
+        };
+        assert_eq!(slot.to_string(), "ON_SLOT");
+        let wall_clock = WorkerMode::Clock {
+            clock: ClockMode::ExternalClock,
+            period_us: 100_000,
+        };
+        assert_eq!(wall_clock.to_string(), "ON_CLOCK(100MS)");
+        let trade = WorkerMode::Clock {
+            clock: ClockMode::TradeDriven,
+            period_us: 100_000,
+        };
+        assert_eq!(trade.to_string(), "ON_TRADE");
     }
 
     // ─────────────────────────────────────────────────────────────────────────────

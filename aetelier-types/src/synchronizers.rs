@@ -46,6 +46,7 @@ impl fmt::Display for WorkerMode {
                     ClockMode::TradeDriven => "ON_TRADE",
                     ClockMode::LiquidationDriven => "ON_LIQUIDATION",
                     ClockMode::ExternalClock => "ON_CLOCK",
+                    ClockMode::SlotDriven => "ON_SLOT",
                 };
                 // Convert period_us (microseconds) to a human-readable string.
                 let period_str = match *period_us {
@@ -62,7 +63,8 @@ impl fmt::Display for WorkerMode {
                 match clock {
                     ClockMode::OrderbookDriven
                     | ClockMode::TradeDriven
-                    | ClockMode::LiquidationDriven => write!(f, "{}", label),
+                    | ClockMode::LiquidationDriven
+                    | ClockMode::SlotDriven => write!(f, "{}", label),
                     ClockMode::ExternalClock => write!(f, "{}({})", label, period_str),
                 }
             }
@@ -107,4 +109,6 @@ pub enum ClockMode {
     /// providing a timestamp. This decouples snapshot emission from any
     /// particular data feed's arrival rate.
     ExternalClock,
+
+    SlotDriven,
 }

@@ -334,6 +334,7 @@ pub struct FeedToggle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -414,6 +415,8 @@ pub enum SyncMode {
     /// An external wall-clock timer advances the grid.
     #[serde(rename = "on_time")]
     OnTime,
+    #[serde(rename = "on_slot")]
+    OnSlot,
 }
 
 /// Time unit for [`UpdateFrequency`].
@@ -482,12 +485,7 @@ impl MarketSnapshotConfig {
 
     /// Map [`SyncMode`] to the library's [`ClockMode`].
     pub fn clock_mode(&self) -> ClockMode {
-        match self.symbol.sync_mode {
-            SyncMode::OnOrderbook => ClockMode::OrderbookDriven,
-            SyncMode::OnTrade => ClockMode::TradeDriven,
-            SyncMode::OnLiquidation => ClockMode::LiquidationDriven,
-            SyncMode::OnTime => ClockMode::ExternalClock,
-        }
+        self.symbol.sync_mode.clock_mode()
     }
 
     /// Human-readable label for the active clock mode.
@@ -497,6 +495,7 @@ impl MarketSnapshotConfig {
             SyncMode::OnTrade => "ClockMode::TradeDriven",
             SyncMode::OnLiquidation => "ClockMode::LiquidationDriven",
             SyncMode::OnTime => "ClockMode::ExternalClock",
+            SyncMode::OnSlot => "ClockMode::SlotDriven",
         }
     }
 
@@ -610,6 +609,18 @@ impl MarketSnapshotConfig {
     }
 }
 
+impl SyncMode {
+    pub const fn clock_mode(self) -> ClockMode {
+        match self {
+            SyncMode::OnOrderbook => ClockMode::OrderbookDriven,
+            SyncMode::OnTrade => ClockMode::TradeDriven,
+            SyncMode::OnLiquidation => ClockMode::LiquidationDriven,
+            SyncMode::OnTime => ClockMode::ExternalClock,
+            SyncMode::OnSlot => ClockMode::SlotDriven,
+        }
+    }
+}
+
 impl std::fmt::Display for SyncMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -617,6 +628,7 @@ impl std::fmt::Display for SyncMode {
             Self::OnTrade => write!(f, "on_trade"),
             Self::OnLiquidation => write!(f, "on_liquidation"),
             Self::OnTime => write!(f, "on_time"),
+            Self::OnSlot => write!(f, "on_slot"),
         }
     }
 }

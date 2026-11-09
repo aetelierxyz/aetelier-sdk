@@ -930,6 +930,7 @@ impl SourceRuntime {
             FeedDatatype::Trades => &mut self.live_trades,
             FeedDatatype::FundingRates => &mut self.live_funding,
             FeedDatatype::OpenInterest => &mut self.live_oi,
+            FeedDatatype::Transactions => return,
         };
         let first_data = set.insert(pair.clone());
         let cadence_watched = self.datatype_cadence.contains_key(&datatype);
