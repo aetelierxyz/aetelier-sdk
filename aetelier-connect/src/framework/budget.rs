@@ -272,6 +272,12 @@ impl SourceMetrics {
         self.inner.conn_epoch_us.load(Ordering::Relaxed)
     }
 
+    pub fn set_conn_epoch_us(&self, conn_epoch_us: u64) {
+        self.inner
+            .conn_epoch_us
+            .fetch_max(conn_epoch_us, Ordering::AcqRel);
+    }
+
     /// One decoded wire frame reached the normalizer.
     pub fn bump_msgs(&self) {
         self.inner.msgs.fetch_add(1, Ordering::Relaxed);
@@ -557,6 +563,24 @@ mod tests {
         let second = clone.next_conn_epoch_us();
         assert!(second > first);
         assert_eq!(m.conn_epoch_us(), second);
+    }
+
+    #[test]
+    fn an_adopted_conn_epoch_is_read_back_and_never_moves_backwards() {
+        let m = SourceMetrics::default();
+        let worker = m.clone();
+        m.set_conn_epoch_us(1_791_321_000_000_000);
+        assert_eq!(worker.conn_epoch_us(), 1_791_321_000_000_000);
+        m.set_conn_epoch_us(1_791_320_000_000_000);
+        assert_eq!(worker.conn_epoch_us(), 1_791_321_000_000_000);
+        worker.set_conn_epoch_us(1_791_321_000_000_001);
+        assert_eq!(m.conn_epoch_us(), 1_791_321_000_000_001);
+        let minted = m.next_conn_epoch_us();
+        assert!(minted > 1_791_321_000_000_001, "{minted}");
+        m.set_conn_epoch_us(1_791_321_000_000_001);
+        assert_eq!(worker.conn_epoch_us(), minted);
+        assert!(worker.next_conn_epoch_us() > minted);
+        assert_eq!(m.snapshot(), SourceMetricsSnapshot::default());
     }
     use super::*;
 

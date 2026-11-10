@@ -1,12 +1,19 @@
+pub mod assemble;
+pub mod attach;
+pub mod connection;
 pub mod decode;
+pub mod pool;
 pub mod request;
 pub mod session;
 pub mod status;
 
+pub use attach::{GrpcAttach, drive_grpc};
+pub use connection::ATTACH_QUEUE_BANKS;
 pub use decode::{
     GrpcUpdate, MalformedTransaction, TransactionUpdate, block_meta, decode_transaction,
     decode_update, execution_error,
 };
+pub use pool::{AttachError, AttachId, AttachSpec, ConnectionKey, GrpcConnections};
 pub use request::{
     BLOCKS_META_FILTER, StreamFilter, TRANSACTIONS_FILTER, commitment_level, ping_request,
 };

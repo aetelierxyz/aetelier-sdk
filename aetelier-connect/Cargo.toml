@@ -60,6 +60,11 @@ name = "conformance"
 path = "tests/conformance.rs"
 
 [[test]]
+name = "geyser"
+path = "tests/geyser.rs"
+required-features = ["grpc"]
+
+[[test]]
 name = "parity"
 path = "tests/parity.rs"
 
@@ -209,6 +214,7 @@ yellowstone-grpc-proto = { version = "14.0.1", optional = true }
 [dev-dependencies]
 aetelier-io = { path = "../aetelier-io", features = ["parquet"] }
 futures = { version = "0.3" }
+hyper-util = { version = "0.1", features = ["tokio"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["frame", "std"] }
 aetelier-types = { path = "../aetelier-types", version = "0.1.1" }
 futures-util = "0.3"
@@ -216,6 +222,7 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tower = { version = "0.5", features = ["util"] }
 yellowstone-grpc-client = { version = "17", features = ["test-tools"] }
 
 [features]

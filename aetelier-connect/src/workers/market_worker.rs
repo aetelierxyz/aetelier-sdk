@@ -1751,7 +1751,7 @@ fn framework_instrument(
 /// `[reconnect]` section. Unset fields take the framework defaults (1 s
 /// initial, 30 s cap, infinite attempts, 0.5 jitter) rather than the
 /// legacy `ConnectionManagerConfig` defaults.
-fn framework_reconnect_policy(
+pub(crate) fn framework_reconnect_policy(
     section: Option<&crate::config::workers::common::ReconnectSection>,
 ) -> crate::clients::reconnect::ReconnectPolicy {
     let default = crate::config::workers::common::ReconnectSection::default();
