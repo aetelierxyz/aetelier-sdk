@@ -658,6 +658,62 @@ async fn the_last_detach_closes_the_connection() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_attach_queued_behind_the_last_detach_joins_the_open_subscription() {
+    let mock = MockGeyser::default();
+    mock.auto_pong(false);
+    let (pool, dial) = duplex_pool(&mock);
+    let chain = Chain::recent();
+    let (mut a, _) = join(&pool, section(), 1, 8);
+    let mut connection = subscribed(&mock).await;
+    connection.send(pong(1));
+    lead_in(&connection, &chain, 100);
+    connection.send_all(chain.bank(102, &[(0, &[address(1)])]));
+    assert_eq!(
+        kinds(&next_batch(&mut a).await),
+        vec!["row 102:0", "tick 102"]
+    );
+    let (refused, _) = join(&pool, section(), 2, 8);
+    assert_eq!(
+        account_include(&connection.next_request().await),
+        base58(&[1, 2])
+    );
+    assert!(ping_id(&connection.next_request().await).is_some());
+    connection.fail(Status::invalid_argument(
+        "account_include names a closed account",
+    ));
+    assert_eq!(kinds(&next_batch(&mut a).await), vec!["lost"]);
+    let mut reconnected = subscribed(&mock).await;
+    assert_eq!(account_include(reconnected.first_request()), base58(&[1]));
+    assert_eq!(kinds(&next_batch(&mut a).await), vec!["resumed"]);
+    reconnected.send(pong(1));
+    lead_in(&reconnected, &chain, 120);
+    reconnected.send_all(chain.bank(122, &[(0, &[address(1)])]));
+    assert_eq!(
+        kinds(&next_batch(&mut a).await),
+        vec!["gap 102->122 lost 19", "row 122:0", "tick 122"]
+    );
+    drop(a);
+    let (mut late, _) = join(&pool, section(), 3, 8);
+    let update = reconnected.next_request().await;
+    assert_eq!(account_include(&update), base58(&[3]));
+    assert_eq!((update.ping, update.from_slot), (None, None));
+    let ack = ping_id(&reconnected.next_request().await).expect("a ping-only request");
+    reconnected.send(pong(ack));
+    reconnected.send_all(chain.bank(123, &[(0, &[address(3)])]));
+    reconnected.send_all(chain.bank(124, &[(0, &[address(3)])]));
+    assert_eq!(
+        kinds(&next_batch(&mut late).await),
+        vec!["row 124:0", "tick 124"]
+    );
+    assert_eq!(dial.dials().len(), 2);
+    assert_eq!(mock.subscribes().len(), 2);
+    assert_eq!(pool.connections()[0].1, 2);
+    let reason = rejected(refused.finish().await);
+    assert!(reason.starts_with("filter update rejected: "), "{reason}");
+    assert_eq!(pool.connections()[0].1, 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn every_attach_of_one_physical_connection_carries_its_conn_epoch_and_recv_seq() {
     let mock = MockGeyser::default();
     let (pool, _dial) = duplex_pool(&mock);

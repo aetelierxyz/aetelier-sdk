@@ -371,7 +371,7 @@ impl GeyserDial for DuplexDial {
             .connect_with_connector(connector)
             .await
             .map(GeyserChannel::Client)
-            .map_err(|error| GrpcExitReason::Connect(error.to_string()))
+            .map_err(|error| GrpcExitReason::Connect(error_text(&error)))
     }
 }
 
@@ -488,4 +488,17 @@ impl AsyncWrite for WireEnd {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("the mock state is not poisoned")
+}
+
+fn error_text(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !text.ends_with(&message) {
+            text = format!("{text}: {message}");
+        }
+        source = cause.source();
+    }
+    text
 }

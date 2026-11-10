@@ -589,7 +589,7 @@ async fn run(
             .attempt(&mut core, &mut commands, &mut policy, &mut server)
             .await
         else {
-            break;
+            continue;
         };
         let now = Instant::now();
         let (reason, action, cool_down) = match exit.classify(&server) {
@@ -613,7 +613,7 @@ async fn run(
                     "framework.grpc.terminal"
                 );
                 core.on_terminal(&reason);
-                refuse_queued(&mut commands, &reason);
+                refuse_queued(&mut commands, &reason).await;
                 break;
             }
         };
@@ -670,7 +670,10 @@ impl Link<'_> {
         .await;
         let mut session = match opened {
             Ok(Ok(session)) => session,
-            Ok(Err(exit)) => return Some(exit),
+            Ok(Err((exit, version))) => {
+                *server = version;
+                return Some(exit);
+            }
             Err(_) => return Some(open_timed_out()),
         };
         server.clone_from(session.server());
@@ -710,12 +713,7 @@ impl Link<'_> {
             }
             tokio::select! {
                 biased;
-                command = commands.recv() => {
-                    core.apply(command?);
-                    if core.is_empty() {
-                        return None;
-                    }
-                }
+                command = commands.recv() => core.apply(command?),
                 event = session.next() => match event {
                     Ok(SessionEvent::Update { update, receipt }) => {
                         let update = decode_update(update, receipt);
@@ -760,16 +758,13 @@ async fn wait_for_attempt(
     commands: &mut mpsc::UnboundedReceiver<Command>,
 ) -> bool {
     loop {
-        if core.is_empty() {
-            return false;
-        }
         tokio::select! {
             biased;
             command = commands.recv() => match command {
                 Some(command) => core.apply(command),
                 None => return false,
             },
-            () = sleep_until(at) => return true,
+            () = sleep_until(at), if !core.is_empty() => return true,
         }
     }
 }
@@ -784,9 +779,9 @@ fn drain(
     !core.is_empty()
 }
 
-fn refuse_queued(commands: &mut mpsc::UnboundedReceiver<Command>, reason: &str) {
+async fn refuse_queued(commands: &mut mpsc::UnboundedReceiver<Command>, reason: &str) {
     commands.close();
-    while let Ok(command) = commands.try_recv() {
+    while let Some(command) = commands.recv().await {
         if let Command::Attach(attach) = command {
             let _ = attach.exit.send(TaskExit::Failed(rejection(reason)));
         }
@@ -799,6 +794,8 @@ fn open_timed_out() -> GrpcExitReason {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::clients::disconnect::DisconnectReason;
     use crate::framework::grpc::decode::TransactionUpdate;
@@ -859,22 +856,29 @@ mod tests {
         ConnectionCore::new("solana", section(), SourceMetrics::default())
     }
 
-    fn join(core: &mut ConnectionCore, id: u64, seed: u8, queue: usize) -> Probe {
+    fn new_attach(id: u64, seed: u8, queue: usize) -> (NewAttach, Probe) {
         let (events, receiver) = mpsc::channel(queue);
         let (exit, outcome) = oneshot::channel();
         let metrics = SourceMetrics::default();
-        core.add(NewAttach {
+        let attach = NewAttach {
             id: AttachId(id),
             watch: watching(seed),
             metrics: metrics.clone(),
             events,
             exit,
-        });
-        Probe {
+        };
+        let probe = Probe {
             events: receiver,
             exit: outcome,
             metrics,
-        }
+        };
+        (attach, probe)
+    }
+
+    fn join(core: &mut ConnectionCore, id: u64, seed: u8, queue: usize) -> Probe {
+        let (attach, probe) = new_attach(id, seed, queue);
+        core.add(attach);
+        probe
     }
 
     fn block(slot: u64) -> BlockMeta {
@@ -1550,26 +1554,17 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_dial_that_never_completes_times_out_and_retries() {
-        let stalled = Arc::new(StalledDial::default());
-        let dial: Arc<dyn GeyserDial> = stalled.clone();
-        let (events, mut received) = mpsc::channel(8);
-        let (exit, _outcome) = oneshot::channel();
-        let first = NewAttach {
-            id: AttachId(1),
-            watch: watching(1),
-            metrics: SourceMetrics::default(),
-            events,
-            exit,
-        };
-        let key = ConnectionKey {
+    fn task_key() -> ConnectionKey {
+        ConnectionKey {
             endpoint: section().endpoint,
             commitment: Commitment::Finalized,
             token_env: None,
             shard: 0,
-        };
-        let context = ConnectionContext {
+        }
+    }
+
+    fn task_context() -> ConnectionContext {
+        ConnectionContext {
             venue: "solana",
             section: section(),
             x_token: None,
@@ -1583,20 +1578,31 @@ mod tests {
                 max: 10,
                 per: Duration::from_secs(60),
             },
-        };
-        let started = Instant::now();
-        let connection = SharedGrpcConnection::spawn(key, context, dial, first);
-        let batch = timeout(Duration::from_secs(20), received.recv())
+        }
+    }
+
+    async fn next_loss(probe: &mut Probe, within: Duration) -> String {
+        let batch = timeout(within, probe.events.recv())
             .await
             .expect("the loss arrives")
             .expect("the attach is open");
-        assert_eq!(started.elapsed(), OPEN_TIMEOUT);
         match batch.as_slice() {
-            [DomainEvent::ConnectionLost { reason }] => {
-                assert!(reason.contains("open timed out after 15s"), "{reason}");
-            }
+            [DomainEvent::ConnectionLost { reason }] => reason.clone(),
             other => panic!("expected one loss, got {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_that_never_completes_times_out_and_retries() {
+        let stalled = Arc::new(StalledDial::default());
+        let dial: Arc<dyn GeyserDial> = stalled.clone();
+        let (first, mut probe) = new_attach(1, 1, 8);
+        let started = Instant::now();
+        let connection =
+            SharedGrpcConnection::spawn(task_key(), task_context(), dial, first);
+        let reason = next_loss(&mut probe, Duration::from_secs(20)).await;
+        assert_eq!(started.elapsed(), OPEN_TIMEOUT);
+        assert!(reason.contains("open timed out after 15s"), "{reason}");
         sleep_until(started + Duration::from_secs(18)).await;
         assert_eq!(
             *stalled.dials.lock().expect("dials"),
@@ -1604,10 +1610,120 @@ mod tests {
         );
         assert!(!connection.is_closed());
         assert!(connection.send(Command::Detach(AttachId(1))).is_ok());
-        sleep_until(started + Duration::from_secs(31)).await;
-        assert!(!connection.is_closed());
-        sleep_until(started + Duration::from_secs(33)).await;
-        assert!(connection.is_closed());
+        next_loss(&mut probe, Duration::from_secs(20)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(17) + OPEN_TIMEOUT);
+        assert!(probe.events.recv().await.is_none());
+        sleep_until(started + Duration::from_secs(120)).await;
         assert_eq!(stalled.dials.lock().expect("dials").len(), 2);
+        assert!(!connection.is_closed());
+        drop(connection);
+        sleep_until(started + Duration::from_secs(121)).await;
+        assert_eq!(Arc::strong_count(&stalled), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attach_queued_behind_the_last_detach_is_dialed_for_and_never_dropped() {
+        let stalled = Arc::new(StalledDial::default());
+        let dial: Arc<dyn GeyserDial> = stalled.clone();
+        let (first, mut leaving) = new_attach(1, 1, 8);
+        let started = Instant::now();
+        let connection =
+            SharedGrpcConnection::spawn(task_key(), task_context(), dial, first);
+        next_loss(&mut leaving, Duration::from_secs(20)).await;
+        assert_eq!(started.elapsed(), OPEN_TIMEOUT);
+        let (second, mut joining) = new_attach(2, 2, 8);
+        assert!(connection.send(Command::Detach(AttachId(1))).is_ok());
+        assert!(connection.send(Command::Attach(second)).is_ok());
+        assert!(leaving.events.recv().await.is_none());
+        let reason = next_loss(&mut joining, Duration::from_secs(40)).await;
+        assert!(reason.contains("open timed out after 15s"), "{reason}");
+        assert_eq!(started.elapsed(), Duration::from_secs(17) + OPEN_TIMEOUT);
+        assert_eq!(
+            *stalled.dials.lock().expect("dials"),
+            vec![started, started + Duration::from_secs(17)]
+        );
+        assert_eq!(
+            joining.exit.try_recv().err(),
+            Some(oneshot::error::TryRecvError::Empty)
+        );
+        assert!(!connection.is_closed());
+    }
+
+    #[derive(Default)]
+    struct TerminalDial {
+        dialing: AtomicBool,
+        released: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl GeyserDial for TerminalDial {
+        async fn dial(
+            &self,
+            _settings: &GrpcSettings,
+        ) -> Result<GeyserChannel, GrpcExitReason> {
+            self.dialing.store(true, Ordering::Release);
+            while !self.released.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Err(GrpcExitReason::Setup("invalid uri character".to_string()))
+        }
+    }
+
+    #[test]
+    fn an_attach_accepted_while_a_terminal_exit_closes_the_connection_is_rejected() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("a runtime");
+        let handle = runtime.handle().clone();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let driver = std::thread::spawn(move || runtime.block_on(stopped));
+        let entered = handle.enter();
+        let mut spins = 0u64;
+        let (mut accepted, mut lost) = (0, Vec::new());
+        for _ in 0..10_000 {
+            let terminal = Arc::new(TerminalDial::default());
+            let dial: Arc<dyn GeyserDial> = terminal.clone();
+            let (first, _first) = new_attach(1, 1, 8);
+            let (late, probe) = new_attach(2, 2, 8);
+            let connection =
+                SharedGrpcConnection::spawn(task_key(), task_context(), dial, first);
+            while !terminal.dialing.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            terminal.released.store(true, Ordering::Release);
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+            let sent = connection.send(Command::Attach(late)).is_ok();
+            drop(connection);
+            if !sent {
+                spins = spins.saturating_sub(8);
+                continue;
+            }
+            spins += 8;
+            accepted += 1;
+            match probe.exit.blocking_recv() {
+                Ok(TaskExit::Failed(DisconnectReason::ProtocolRejection {
+                    code: 0,
+                    reason,
+                })) if reason == "invalid uri character" => {}
+                other => lost.push(format!("{other:?}")),
+            }
+        }
+        drop(entered);
+        stop.send(()).expect("the runtime is running");
+        driver
+            .join()
+            .expect("the runtime thread ends")
+            .expect("the runtime stops on request");
+        assert!(accepted > 0);
+        assert!(
+            lost.is_empty(),
+            "{} of {accepted} accepted attaches ended without the rejection: {:?}",
+            lost.len(),
+            lost.first()
+        );
     }
 }

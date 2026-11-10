@@ -16,7 +16,7 @@ use yellowstone_grpc_proto::prelude::{
 use yellowstone_grpc_proto::tonic::codec::CompressionEncoding;
 
 use super::request::ping_request;
-use super::status::{GrpcExitReason, PendingRequest, ServerVersion};
+use super::status::{GrpcExitReason, PendingRequest, ServerVersion, with_causes};
 use crate::config::workers::market_worker_config::GrpcSection;
 use crate::framework::budget::SourceMetrics;
 use crate::framework::onchain::ReceiptStamp;
@@ -144,7 +144,7 @@ impl GeyserDial for NetworkDial {
             .connect()
             .await
             .map(GeyserChannel::Client)
-            .map_err(|error| GrpcExitReason::Connect(error.to_string()))
+            .map_err(connect_error)
     }
 }
 
@@ -185,7 +185,7 @@ impl GrpcSession {
         request: SubscribeRequest,
         settings: &GrpcSettings,
         epochs: &SourceMetrics,
-    ) -> Result<Self, GrpcExitReason> {
+    ) -> Result<Self, (GrpcExitReason, ServerVersion)> {
         let (sink, stream, server, client) = match channel {
             GeyserChannel::Client(mut client) => {
                 let server = match client.get_version().await {
@@ -199,19 +199,18 @@ impl GrpcSession {
                         ServerVersion::default()
                     }
                 };
-                let (sink, stream) = client
-                    .subscribe_with_request(Some(request))
-                    .await
-                    .map_err(subscribe_error)?;
-                (sink, stream, server, Some(client))
+                match client.subscribe_with_request(Some(request)).await {
+                    Ok((sink, stream)) => (sink, stream, server, Some(client)),
+                    Err(error) => return Err((subscribe_error(error), server)),
+                }
             }
             GeyserChannel::Opened {
                 mut requests,
                 updates,
-            } => {
-                send(&mut requests, request)?;
-                (requests, updates, ServerVersion::default(), None)
-            }
+            } => match send(&mut requests, request) {
+                Ok(()) => (requests, updates, ServerVersion::default(), None),
+                Err(exit) => return Err((exit, ServerVersion::default())),
+            },
         };
         let conn_epoch_us = epochs.next_conn_epoch_us();
         let now = Instant::now();
@@ -232,8 +231,13 @@ impl GrpcSession {
             recv_seq: 0,
             conn_epoch_us,
         };
-        session.opening_ack = session.acknowledge(PendingRequest::Subscribe)?;
-        Ok(session)
+        match session.acknowledge(PendingRequest::Subscribe) {
+            Ok(ack) => {
+                session.opening_ack = ack;
+                Ok(session)
+            }
+            Err(exit) => Err((exit, session.server)),
+        }
     }
 
     pub fn server(&self) -> &ServerVersion {
@@ -425,7 +429,11 @@ fn send(
 }
 
 fn setup_error(error: GeyserGrpcBuilderError) -> GrpcExitReason {
-    GrpcExitReason::Setup(error.to_string())
+    GrpcExitReason::Setup(error_text(&error))
+}
+
+fn connect_error(error: GeyserGrpcBuilderError) -> GrpcExitReason {
+    GrpcExitReason::Connect(error_text(&error))
 }
 
 fn subscribe_error(error: GeyserGrpcClientError) -> GrpcExitReason {
@@ -434,10 +442,14 @@ fn subscribe_error(error: GeyserGrpcClientError) -> GrpcExitReason {
             status,
             pending: Some(PendingRequest::Subscribe),
         },
-        GeyserGrpcClientError::TransportError(error) => {
-            GrpcExitReason::Connect(error.to_string())
+        transport @ GeyserGrpcClientError::TransportError(_) => {
+            GrpcExitReason::Connect(error_text(&transport))
         }
     }
+}
+
+fn error_text(error: &dyn std::error::Error) -> String {
+    with_causes(error.to_string(), error.source())
 }
 
 fn now_us() -> u64 {
@@ -457,10 +469,13 @@ mod tests {
     use crate::framework::onchain::WatchedAddress;
     use crate::framework::onchain::decoded::fixtures::key;
     use aetelier_types::onchain::{Commitment, MatchRole};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::DuplexStream;
     use yellowstone_grpc_proto::prelude::{
         SubscribeUpdateBlockMeta, SubscribeUpdatePing, SubscribeUpdatePong,
         SubscribeUpdateTransaction,
     };
+    use yellowstone_grpc_proto::tonic::transport::Uri;
     use yellowstone_grpc_proto::tonic::{Code, Status};
 
     type Requests = futures::channel::mpsc::Receiver<SubscribeRequest>;
@@ -795,10 +810,47 @@ mod tests {
             panic!("expected a setup error, got {exit:?}");
         };
         assert!(!message.contains("bad"), "{message}");
+        assert_eq!(
+            message,
+            "Failed to parse x-token: failed to parse metadata value"
+        );
         assert!(!exit.to_string().contains("bad"), "{exit}");
         match exit.classify(&ServerVersion::default()) {
             ExitClass::Reject { reason } => assert!(!reason.contains("bad"), "{reason}"),
             other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_names_each_distinct_cause_once() {
+        let plain = GrpcSettings {
+            endpoint: "http://127.0.0.1:10000".to_string(),
+            ..settings()
+        };
+        let refusing = tower::service_fn(|_: Uri| async {
+            Err::<TokioIo<DuplexStream>, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            ))
+        });
+        let Err(error) = plain
+            .builder()
+            .expect("the http builder")
+            .connect_with_connector(refusing)
+            .await
+        else {
+            panic!("a refusing connector never connects");
+        };
+        assert_eq!(error.to_string(), "gRPC transport error: transport error");
+        let exit = connect_error(error);
+        let cause = "gRPC transport error: transport error: connection refused";
+        assert_eq!(exit.to_string(), format!("gRPC connect failed: {cause}"));
+        match exit.classify(&ServerVersion::default()) {
+            ExitClass::Retry {
+                reason: DisconnectReason::TransportError { source },
+                cool_down: None,
+            } => assert_eq!(source.to_string(), cause),
+            other => panic!("expected a transport retry, got {other:?}"),
         }
     }
 
@@ -1193,13 +1245,14 @@ mod tests {
         let metrics = SourceMetrics::default();
         let (channel, requests, _updates) = link();
         drop(requests);
-        let exit =
+        let (exit, server) =
             match GrpcSession::open(channel, subscription(&[1]), &settings(), &metrics)
                 .await
             {
                 Ok(_) => panic!("a session opened without a request receiver"),
-                Err(exit) => exit,
+                Err(failed) => failed,
             };
+        assert_eq!(server, ServerVersion::default());
         assert!(matches!(exit, GrpcExitReason::RequestFailed(_)), "{exit:?}");
         assert_eq!(metrics.conn_epoch_us(), 0);
         assert!(retried_as_heartbeat_failure(exit));

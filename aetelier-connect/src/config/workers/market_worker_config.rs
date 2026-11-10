@@ -120,6 +120,10 @@ fn default_max_addresses_per_connection() -> usize {
     50
 }
 
+const MAX_PING_INTERVAL_SECS: u64 = 3_600;
+
+const MAX_PENDING_SLOTS: u64 = 10_000;
+
 impl GrpcSection {
     pub fn validate(&self) -> Result<(), String> {
         if !(self.endpoint.starts_with("http://")
@@ -154,9 +158,29 @@ impl GrpcSection {
         ]
         .into_iter()
         .find_map(|(key, zero)| zero.then_some(key));
-        match zero_limit {
-            Some(key) => Err(format!(
+        if let Some(key) = zero_limit {
+            return Err(format!(
                 "[collect.grpc] {key} = 0 admits nothing: set it to 1 or more"
+            ));
+        }
+        let over_limit = [
+            (
+                "ping_interval_secs",
+                self.ping_interval_secs,
+                MAX_PING_INTERVAL_SECS,
+            ),
+            (
+                "max_pending_slots",
+                self.max_pending_slots,
+                MAX_PENDING_SLOTS,
+            ),
+        ]
+        .into_iter()
+        .find(|&(_, value, limit)| value > limit);
+        match over_limit {
+            Some((key, value, limit)) => Err(format!(
+                "[collect.grpc] {key} = {value} is above the limit of {limit}: set it to \
+                 {limit} or less"
             )),
             None => Ok(()),
         }
@@ -179,6 +203,9 @@ impl GrpcSection {
     }
 
     pub fn shard_size(&self) -> usize {
+        if !self.server_filter {
+            return usize::MAX;
+        }
         match self.account_include_max {
             Some(max) => self.max_addresses_per_connection.min(max),
             None => self.max_addresses_per_connection,
@@ -348,6 +375,9 @@ impl MarketWorkerConfig {
             );
         };
         grpc.validate()?;
+        if let Some(reconnect) = &self.common.reconnect {
+            admit_reconnect(reconnect)?;
+        }
         grpc.admit_token(|name| std::env::var(name).ok())?;
         let address = ChainAddress::parse(chain, &self.common.symbol).map_err(|e| {
             format!(
@@ -407,6 +437,40 @@ impl MarketWorkerConfig {
         )?;
         admit_datatypes(exchange, adapter.supported_datatypes(), &declared)
     }
+}
+
+const FRAMEWORK_INITIAL_DELAY_MS: u64 = 1_000;
+
+const FRAMEWORK_MAX_DELAY_MS: u64 = 30_000;
+
+const FRAMEWORK_JITTER_FACTOR: f64 = 0.5;
+
+fn admit_reconnect(reconnect: &ReconnectSection) -> Result<(), String> {
+    let initial = reconnect
+        .initial_delay_ms
+        .unwrap_or(FRAMEWORK_INITIAL_DELAY_MS);
+    let max = reconnect.max_delay_ms.unwrap_or(FRAMEWORK_MAX_DELAY_MS);
+    let jitter = reconnect.jitter_factor.unwrap_or(FRAMEWORK_JITTER_FACTOR);
+    if !(0.0..=1.0).contains(&jitter) {
+        return Err(format!(
+            "[collect.reconnect] jitter_factor = {jitter:?} is not a fraction of the \
+             delay: set it from 0.0 to 1.0"
+        ));
+    }
+    if initial == 0 && jitter > 0.0 {
+        return Err(
+            "[collect.reconnect] initial_delay_ms = 0 leaves no delay to jitter: set it \
+             to 1 or more, or set jitter_factor = 0.0"
+                .to_string(),
+        );
+    }
+    if initial > max {
+        return Err(format!(
+            "[collect.reconnect] initial_delay_ms = {initial} is above max_delay_ms = \
+             {max}: set it to {max} or less, or raise max_delay_ms"
+        ));
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────
@@ -1172,6 +1236,51 @@ symbol = "BTC"
     }
 
     #[test]
+    fn grpc_section_validate_caps_the_ping_interval_and_pending_slots() {
+        let capped = GrpcSection {
+            ping_interval_secs: 3_600,
+            max_pending_slots: 10_000,
+            ..grpc_defaults()
+        };
+        assert_eq!(capped.validate(), Ok(()));
+        for (section, reason) in [
+            (
+                GrpcSection {
+                    ping_interval_secs: 3_601,
+                    ..capped.clone()
+                },
+                "[collect.grpc] ping_interval_secs = 3601 is above the limit of 3600: set \
+                 it to 3600 or less",
+            ),
+            (
+                GrpcSection {
+                    max_pending_slots: 10_001,
+                    ..capped.clone()
+                },
+                "[collect.grpc] max_pending_slots = 10001 is above the limit of 10000: set \
+                 it to 10000 or less",
+            ),
+        ] {
+            assert_eq!(section.validate(), Err(reason.to_string()));
+        }
+        for (key, limit) in [("ping_interval_secs", 3_600), ("max_pending_slots", 10_000)]
+        {
+            let toml = solana_manifest("").replace(
+                "[collect.grpc]\n",
+                &format!("[collect.grpc]\n{key} = {}\n", i64::MAX),
+            );
+            assert_eq!(
+                refusal(&resolve(&toml)),
+                format!(
+                    "[collect.grpc] {key} = {} is above the limit of {limit}: set it to \
+                     {limit} or less",
+                    i64::MAX
+                )
+            );
+        }
+    }
+
+    #[test]
     fn grpc_token_env_must_be_set_and_non_empty() {
         let mut section = grpc_defaults();
         assert_eq!(section.admit_token(|_| None), Ok(()), "no variable named");
@@ -1195,6 +1304,17 @@ symbol = "BTC"
         assert_eq!(section.shard_size(), 50);
         section.max_addresses_per_connection = 5;
         assert_eq!(section.shard_size(), 5);
+    }
+
+    #[test]
+    fn without_server_filtering_one_shard_takes_every_address() {
+        let section = GrpcSection {
+            server_filter: false,
+            max_addresses_per_connection: 5,
+            account_include_max: Some(1),
+            ..grpc_defaults()
+        };
+        assert_eq!(section.shard_size(), usize::MAX);
     }
 
     #[test]
@@ -1588,6 +1708,63 @@ symbol = "BTCUSDT"
                  variable: export {name} with the provider token"
             )
         );
+    }
+
+    #[test]
+    fn solana_refuses_reconnect_settings_the_backoff_cannot_use() {
+        let reconnect = |keys: &str| format!("\n[collect.reconnect]\n{keys}\n");
+        let no_delay = "[collect.reconnect] initial_delay_ms = 0 leaves no delay to jitter: \
+                        set it to 1 or more, or set jitter_factor = 0.0";
+        let not_a_fraction = |value: &str| {
+            format!(
+                "[collect.reconnect] jitter_factor = {value} is not a fraction of the \
+                 delay: set it from 0.0 to 1.0"
+            )
+        };
+        let above_max = |initial: u64, max: u64| {
+            format!(
+                "[collect.reconnect] initial_delay_ms = {initial} is above max_delay_ms = \
+                 {max}: set it to {max} or less, or raise max_delay_ms"
+            )
+        };
+        for (keys, reason) in [
+            ("initial_delay_ms = 0", no_delay.to_string()),
+            (
+                "initial_delay_ms = 0\njitter_factor = 0.25",
+                no_delay.to_string(),
+            ),
+            ("jitter_factor = inf", not_a_fraction("inf")),
+            ("jitter_factor = nan", not_a_fraction("NaN")),
+            ("jitter_factor = -0.5", not_a_fraction("-0.5")),
+            ("jitter_factor = 1.5", not_a_fraction("1.5")),
+            (
+                "initial_delay_ms = 0\njitter_factor = inf",
+                not_a_fraction("inf"),
+            ),
+            ("initial_delay_ms = 60000", above_max(60_000, 30_000)),
+            (
+                "initial_delay_ms = 5000\nmax_delay_ms = 4999",
+                above_max(5_000, 4_999),
+            ),
+            ("max_delay_ms = 999", above_max(1_000, 999)),
+        ] {
+            let solana = resolve(&solana_manifest(&reconnect(keys)));
+            assert_eq!(refusal(&solana), reason, "{keys}");
+            let bybit = resolve(&format!("{MINIMAL_MARKET_TOML}{}", reconnect(keys)));
+            assert!(bybit.admit().is_ok(), "{keys}: {:?}", bybit.admit());
+        }
+        for keys in [
+            "initial_delay_ms = 0\njitter_factor = 0.0",
+            "initial_delay_ms = 0\nmax_delay_ms = 0\njitter_factor = 0.0",
+            "initial_delay_ms = 1\nmax_delay_ms = 1",
+            "initial_delay_ms = 30000",
+            "jitter_factor = 1.0",
+            "max_attempts = 3",
+        ] {
+            assert_admitted_or_names_the_grpc_feature(&resolve(&solana_manifest(
+                &reconnect(keys),
+            )));
+        }
     }
 
     #[test]

@@ -220,8 +220,25 @@ fn cool_down(status: &Status) -> Duration {
         })
 }
 
+pub(crate) fn with_causes(
+    mut text: String,
+    mut source: Option<&(dyn std::error::Error + 'static)>,
+) -> String {
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !text.ends_with(&message) {
+            text = format!("{text}: {message}");
+        }
+        source = cause.source();
+    }
+    text
+}
+
 fn status_text(status: &Status) -> String {
-    format!("gRPC {:?}: {}", status.code(), status.message())
+    with_causes(
+        format!("gRPC {:?}: {}", status.code(), status.message()),
+        std::error::Error::source(status),
+    )
 }
 
 fn reject_text(status: &Status, server: &ServerVersion) -> String {
@@ -250,6 +267,8 @@ fn retry_transport(message: String, cool_down: Option<Duration>) -> ExitClass {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::clients::reconnect::{ReconnectAction, ReconnectPolicy};
     use yellowstone_grpc_proto::tonic::metadata::MetadataValue;
@@ -357,6 +376,40 @@ mod tests {
         matches!(policy.next_action(reason), ReconnectAction::GiveUp { .. })
     }
 
+    #[derive(Debug)]
+    struct Cause {
+        text: &'static str,
+        source: Option<Box<Cause>>,
+    }
+
+    impl Cause {
+        fn chain(texts: &[&'static str]) -> Self {
+            let (last, outer) = texts.split_last().expect("at least one cause");
+            outer.iter().rev().fold(
+                Self {
+                    text: last,
+                    source: None,
+                },
+                |source, text| Self {
+                    text,
+                    source: Some(Box::new(source)),
+                },
+            )
+        }
+    }
+
+    impl fmt::Display for Cause {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+
+    impl std::error::Error for Cause {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.source.as_deref()?)
+        }
+    }
+
     #[test]
     fn retryable_codes_reconnect_with_transport_backoff() {
         for code in RETRYABLE {
@@ -382,6 +435,76 @@ mod tests {
                 assert_eq!(backoff(&mut policy(), &reason), Duration::from_millis(20));
             }
         }
+    }
+
+    #[test]
+    fn statuses_built_from_transport_failures_name_each_distinct_cause_once() {
+        let subscribe = Status::from_error(Box::new(Cause::chain(&[
+            "transport error",
+            "connection error",
+            "stream closed because of a broken pipe",
+        ])));
+        assert_eq!(
+            (subscribe.code(), subscribe.message()),
+            (Code::Unknown, "transport error")
+        );
+        let subscribing = GrpcExitReason::Status {
+            status: subscribe,
+            pending: Some(PendingRequest::Subscribe),
+        };
+        let causes = "gRPC Unknown: transport error: connection error: stream closed \
+                      because of a broken pipe";
+        assert_eq!(
+            subscribing.to_string(),
+            format!("{causes} while the subscribe request was unacknowledged")
+        );
+        let (reason, cool_down) = retried(subscribing.classify(&server()));
+        assert_eq!(cool_down, None);
+        assert_eq!(reason.to_string(), format!("transport error: {causes}"));
+
+        let mut reset = Status::new(
+            Code::Unknown,
+            "h2 protocol error: error reading a body from connection",
+        );
+        reset.set_source(Arc::new(Cause::chain(&[
+            "error reading a body from connection",
+            "stream closed because of a broken pipe",
+        ])));
+        let (reason, _) = retried(
+            GrpcExitReason::Status {
+                status: reset,
+                pending: None,
+            }
+            .classify(&server()),
+        );
+        assert_eq!(
+            reason.to_string(),
+            "transport error: gRPC Unknown: h2 protocol error: error reading a body from \
+             connection: stream closed because of a broken pipe"
+        );
+        assert_eq!(backoff(&mut policy(), &reason), Duration::from_millis(20));
+
+        let mut insecure =
+            Status::new(Code::PermissionDenied, "h2 protocol error: http2 error");
+        insecure.set_source(Arc::new(Cause::chain(&[
+            "http2 error",
+            "connection error received: inadequate security",
+        ])));
+        let reason = rejected(
+            GrpcExitReason::Status {
+                status: insecure,
+                pending: None,
+            }
+            .classify(&server()),
+        );
+        assert_eq!(
+            reason,
+            format!(
+                "gRPC PermissionDenied: h2 protocol error: http2 error: connection error \
+                 received: inadequate security ({PROTOCOL_REVISION}, {SERVER}); check the \
+                 token named by [collect.grpc] x_token_env"
+            )
+        );
     }
 
     #[test]

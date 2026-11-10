@@ -38,6 +38,8 @@ pub struct AttachSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttachError {
+    #[error("{reason}")]
+    InvalidSection { reason: String },
     #[error(
         "[collect.grpc] for {endpoint} differs from the section already connected under \
          the same endpoint, commitment and token variable"
@@ -83,6 +85,9 @@ impl GrpcConnections {
             queue_banks,
             metrics,
         } = spec;
+        section
+            .validate()
+            .map_err(|reason| AttachError::InvalidSection { reason })?;
         let mut state = self.inner.lock();
         let group_key = group_key(&section);
         if state
@@ -507,6 +512,71 @@ mod tests {
         let first = narrow_pool.attach(spec(one.clone(), 1)).expect("attach");
         let second = narrow_pool.attach(spec(one, 2)).expect("attach");
         assert_eq!((first.key().shard, second.key().shard), (0, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_server_filtering_every_address_shares_one_connection() {
+        let dial = Arc::new(ScriptedDial::default());
+        let pool = pool(&dial);
+        let unfiltered = GrpcSection {
+            server_filter: false,
+            account_include_max: Some(1),
+            ..capped(2)
+        };
+        let attaches: Vec<GrpcAttach> = (1..=5)
+            .map(|seed| pool.attach(spec(unfiltered.clone(), seed)).expect("attach"))
+            .collect();
+        assert!(
+            attaches
+                .iter()
+                .all(|attach| attach.key() == &shard_key(&unfiltered, 0))
+        );
+        assert_eq!(pool.connections(), vec![(shard_key(&unfiltered, 0), 5)]);
+        settle().await;
+        assert_eq!(dial.dials(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalid_section_is_refused_before_any_dial() {
+        let dial = Arc::new(ScriptedDial::default());
+        let pool = pool(&dial);
+        for (section, reason) in [
+            (
+                GrpcSection {
+                    ping_interval_secs: 0,
+                    ..section()
+                },
+                "[collect.grpc] ping_interval_secs = 0 admits nothing: set it to 1 or more",
+            ),
+            (
+                GrpcSection {
+                    ping_interval_secs: u64::MAX,
+                    ..section()
+                },
+                "[collect.grpc] ping_interval_secs = 18446744073709551615 is above the \
+                 limit of 3600: set it to 3600 or less",
+            ),
+            (
+                GrpcSection {
+                    max_pending_slots: 10_001,
+                    ..section()
+                },
+                "[collect.grpc] max_pending_slots = 10001 is above the limit of 10000: set \
+                 it to 10000 or less",
+            ),
+        ] {
+            let refused = pool.attach(spec(section, 1)).err();
+            assert_eq!(
+                refused,
+                Some(AttachError::InvalidSection {
+                    reason: reason.to_string(),
+                })
+            );
+            assert_eq!(refused.expect("refused").to_string(), reason);
+        }
+        settle().await;
+        assert_eq!(dial.dials(), 0);
+        assert!(pool.connections().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

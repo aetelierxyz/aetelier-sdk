@@ -1155,12 +1155,18 @@ impl MarketWorker {
             let mut last_book_ts_us = 0u64;
             let mut last_trade_ts_us = 0u64;
             let (dev_tx, dev_rx) = mpsc::channel(channel_capacity);
+            let (adapter_stop, adapter_shutdown) = watch::channel(false);
+            let adapter_shutdown = if transport == TransportKind::Grpc {
+                adapter_shutdown
+            } else {
+                shutdown.clone()
+            };
             let adapter_handle = adapter.spawn_env(
                 environment,
                 vec![symbol.clone()],
                 declared_set.clone(),
                 dev_tx,
-                shutdown.clone(),
+                adapter_shutdown,
                 metrics.clone(),
             );
             let runtime = SourceRuntime::new(
@@ -1554,6 +1560,7 @@ impl MarketWorker {
             // Drop the receiver so a runtime parked on a full `out.send`
             // unblocks (its send fails) and returns instead of hanging.
             drop(recon_rx);
+            let _ = adapter_stop.send(true);
             let adapter_exit = adapter_handle.await.unwrap_or_else(|_| {
                 TaskExit::Failed(
                     crate::clients::disconnect::DisconnectReason::TransportError {

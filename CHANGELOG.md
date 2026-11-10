@@ -43,7 +43,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 
 - `WorkerStatus.pair` is an `Instrument`; CEX status JSON is unchanged.
 - `md_worker` admits every worker before starting any.
-- `MarketWorker` refuses `transport = "grpc"`, `sync_mode = "on_slot"`, `market_type = "onchain"` and `[collect.datatypes.transactions]` on CEX venues. A `solana` worker needs `transport = "grpc"`, a valid `[collect.grpc]`, a base58 address, `sync_mode = "on_slot"`, no enabled `[collect.reconcile]` and a declared datatype, and fails naming the `grpc` feature while no solana adapter is built in.
+- `MarketWorker` refuses `transport = "grpc"`, `sync_mode = "on_slot"`, `market_type = "onchain"` and `[collect.datatypes.transactions]` on CEX venues. A `solana` worker needs `transport = "grpc"`, a valid `[collect.grpc]`, a `[collect.reconnect]`, when present, with `jitter_factor` from 0 to 1, a nonzero `initial_delay_ms` when jittered and `initial_delay_ms` at most `max_delay_ms`, a base58 address, `sync_mode = "on_slot"`, no enabled `[collect.reconcile]` and a declared datatype, and fails naming the `grpc` feature while no solana adapter is built in.
 - `DataWorker` refuses chain venues, `market_type = "onchain"` and `[collect.datatypes.transactions]`.
 - `[collect.datatypes.transactions]` rejects unknown keys; a manifest with a chain venue rejects duplicate addresses and unread keys under `[collect.sync]` and `[[workers]]`.
 - `Feed`, `FeedSet` and `SourceRuntime` liveness are keyed by `Instrument`; `Feed::new` takes any `Into<Instrument>`; feed snapshots keep the `BASE/QUOTE` string.

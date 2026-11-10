@@ -195,7 +195,11 @@ async fn a_connection_reset_reconnects_at_tip_after_twice_the_backoff() {
         &first,
     )
     .await;
-    assert!(reason.starts_with("transport error: gRPC"), "{reason}");
+    assert_eq!(
+        reason,
+        "transport error: gRPC Unknown: h2 protocol error: error reading a body from \
+         connection: stream closed because of a broken pipe"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -208,8 +212,7 @@ async fn a_refused_dial_reconnects_after_twice_the_backoff() {
     for _ in 0..2 {
         let lost = within(&mut a, 10).await;
         assert!(
-            lost_reason(&lost).contains("connection refused")
-                || lost_reason(&lost).contains("transport error"),
+            lost_reason(&lost).contains("connection refused"),
             "{lost:?}"
         );
     }
@@ -358,6 +361,7 @@ async fn rejection_statuses_are_terminal_before_and_after_data() {
         let reason = rejected(a.finish().await);
         assert!(reason.starts_with(&code), "{reason}");
         assert!(reason.contains("yellowstone-grpc-proto@14.0.1"), "{reason}");
+        assert!(reason.contains("mock-geyser 0.0.0"), "{reason}");
         sleep(Duration::from_secs(120)).await;
         assert_eq!(dial.dials().len(), 1, "{code}");
         assert_eq!(refusing.subscribes().len(), 1, "{code}");

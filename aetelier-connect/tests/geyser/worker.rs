@@ -8,7 +8,8 @@ use aetelier_connect::framework::FeedState;
 use aetelier_connect::framework::feed::FeedSnapshot;
 use aetelier_connect::framework::grpc::GrpcConnections;
 use aetelier_connect::workers::{
-    FlushReport, MarketWorker, MarketWorkerReport, SnapshotFlusher, WorkerStatus,
+    FlushReport, MarketWorker, MarketWorkerReport, SnapshotFlusher, WorkerCommand,
+    WorkerStatus,
 };
 use aetelier_types::WorkerId;
 use aetelier_types::errors::PersistError;
@@ -16,9 +17,9 @@ use aetelier_types::exchanges::{Exchange, MarketType};
 use aetelier_types::onchain::{ChainAddress, Transaction};
 use aetelier_types::snapshots::MarketSnapshot;
 use aetelier_types::synchronizers::{ClockMode, WorkerMode};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use yellowstone_grpc_proto::tonic::Status;
 
 use crate::chain::{Chain, account_include, address, ping_id, pong, server_ping};
@@ -46,6 +47,7 @@ struct RunningWorker {
     status: watch::Receiver<WorkerStatus>,
     snapshots: Arc<Mutex<Vec<MarketSnapshot>>>,
     stop: watch::Sender<bool>,
+    commands: mpsc::Sender<WorkerCommand>,
     task: JoinHandle<anyhow::Result<MarketWorkerReport>>,
     ledger: PathBuf,
 }
@@ -99,6 +101,10 @@ fn entry(seed: u8, extra: &str) -> String {
 }
 
 fn configs(dir: &Path, workers: &str) -> Vec<MarketWorkerConfig> {
+    configs_with(dir, "", workers)
+}
+
+fn configs_with(dir: &Path, reconnect: &str, workers: &str) -> Vec<MarketWorkerConfig> {
     let toml = format!(
         r#"
 [collect]
@@ -111,7 +117,7 @@ endpoint = "{ENDPOINT}"
 
 [collect.reconnect]
 jitter_factor = 0.0
-
+{reconnect}
 [collect.datatypes.transactions]
 enabled = true
 
@@ -156,17 +162,20 @@ fn start(
     );
     let (status_tx, status) = watch::channel(initial);
     let (stop, shutdown) = watch::channel(false);
+    let (commands, received) = mpsc::channel(4);
     let worker = MarketWorker::from_config_with_flusher(
         config,
         Some(Box::new(RecordingFlusher(snapshots.clone()))),
     )
     .expect("the worker builds")
     .with_grpc_connections(pool.clone())
-    .with_status_sender(status_tx);
+    .with_status_sender(status_tx)
+    .with_command_receiver(received);
     RunningWorker {
         status,
         snapshots,
         stop,
+        commands,
         task: tokio::spawn(worker.run(shutdown)),
         ledger: dir
             .join("gaps")
@@ -506,4 +515,53 @@ async fn a_rejected_update_rejects_only_the_late_worker() {
     );
     assert_eq!(mock.subscribes().len(), 2);
     assert_eq!(dial.dials().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_during_an_outage_detaches_at_once_and_never_redials() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let mock = MockGeyser::default();
+    let (pool, dial) = duplex_pool(&mock);
+    let chain = Chain::recent();
+    let slow = "initial_delay_ms = 20000\nmax_delay_ms = 20000\n";
+    let config = configs_with(dir.path(), slow, &entry(1, "")).remove(0);
+    let mut worker = start(config, &pool, dir.path());
+    let mut connection = subscribed(&mock).await;
+    connection.send_all([chain.meta(100), chain.meta(101)]);
+    connection.send_all(chain.bank(102, &[(0, &[address(1)])]));
+    settle(&mut connection).await;
+    worker.until(streamed(2)).await;
+    connection.reset();
+    worker
+        .until(|status| {
+            states(status)
+                == Some((
+                    ConnectionState::Reconnecting { attempt: 1 },
+                    FeedState::Reconnecting,
+                ))
+        })
+        .await;
+    let stopped_at = Instant::now();
+    worker
+        .commands
+        .send(WorkerCommand::Stop)
+        .await
+        .expect("the worker takes commands");
+    let ended = worker.ended().await;
+    assert!(
+        stopped_at.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        stopped_at.elapsed()
+    );
+    assert!(pool.connections().is_empty());
+    assert_eq!(
+        states(&ended.status),
+        Some((ConnectionState::Disconnected, FeedState::Closed))
+    );
+    assert_eq!(ended.status.reconnect_count, 1);
+    assert_eq!(positions(&ended.rows), [(102, 0)]);
+    assert!(ended.ledger.is_empty(), "{:?}", ended.ledger);
+    sleep(Duration::from_secs(120)).await;
+    assert_eq!(dial.dials().len(), 1);
+    assert_eq!(mock.subscribes().len(), 1);
 }
