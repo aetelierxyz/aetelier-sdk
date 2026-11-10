@@ -23,7 +23,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - Gap ledger cause `slot_gap` with `prev_slot`, `prev_height`, `next_slot`, `next_height` and `blocks_lost`, omitted from lines of other causes.
 - Conformance kind `feed_lifecycle` on every venue.
 - `aetelier_connect::framework::slotbook`: `SourcedSlotbook` assembles transactions per `(slot, bank_id)`, seals each bank on its block meta, releases banks in block-height order with a bounded reorder hold, opens coverage after each subscribe, and reports `SlotGap`, `SlotTick` and loss counters.
-- `aetelier_connect::framework::onchain`: decoded transaction input, address roles, the watched-address predicate, requested compute, `failure_*` derivation and `transaction_rows` for `transactions.v1`.
+- `aetelier_connect::framework::onchain`: decoded transaction input, address roles, the watched-address predicate, requested compute (ComputeBudget payloads read by their leading bytes, as the runtime reads them), `failure_*` derivation and `transaction_rows` for `transactions.v1`.
 - `aetelier_types::onchain::encode_base58`.
 - `ReconstructionModel::Stream` (book level `none`; no books, no seeding).
 - `DomainEvent` and `ReconstructedEvent` `Transaction`, `SlotTick`, `SlotGap`, `ConnectionLost`, `ConnectionResumed`; a slot gap is counted (`slot_gaps`, `blocks_lost`) and written to the gap ledger, never resynced.

@@ -42,14 +42,16 @@ impl DecodedTransaction {
                 Some((&SET_COMPUTE_UNIT_LIMIT, payload))
                     if requested.compute_unit_limit.is_none() =>
                 {
-                    requested.compute_unit_limit =
-                        <[u8; 4]>::try_from(payload).ok().map(u32::from_le_bytes);
+                    requested.compute_unit_limit = payload
+                        .first_chunk::<4>()
+                        .map(|bytes| u32::from_le_bytes(*bytes));
                 }
                 Some((&SET_COMPUTE_UNIT_PRICE, payload))
                     if requested.compute_unit_price_micro_lamports.is_none() =>
                 {
-                    requested.compute_unit_price_micro_lamports =
-                        <[u8; 8]>::try_from(payload).ok().map(u64::from_le_bytes);
+                    requested.compute_unit_price_micro_lamports = payload
+                        .first_chunk::<8>()
+                        .map(|bytes| u64::from_le_bytes(*bytes));
                 }
                 _ => {}
             }
@@ -97,6 +99,22 @@ mod tests {
             RequestedCompute {
                 compute_unit_limit: Some(200_000),
                 compute_unit_price_micro_lamports: Some(1_000),
+                priority_fee_lamports: None,
+            }
+        );
+    }
+
+    #[test]
+    fn payloads_with_trailing_bytes_read_their_leading_value_as_the_runtime_does() {
+        let tx = with_budget_program(vec![
+            budget(&[2, 0x50, 0xc3, 0, 0, 0, 0, 0, 0]),
+            budget(&[3, 0x38, 0xe8, 0, 0, 0, 0, 0, 0, 0xff]),
+        ]);
+        assert_eq!(
+            tx.requested_compute(),
+            RequestedCompute {
+                compute_unit_limit: Some(50_000),
+                compute_unit_price_micro_lamports: Some(59_448),
                 priority_fee_lamports: None,
             }
         );
