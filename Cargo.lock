@@ -23,6 +23,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "flate2",
+ "futures",
  "futures-util",
  "lz4_flex 0.11.6",
  "opentelemetry",

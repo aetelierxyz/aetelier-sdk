@@ -1,5 +1,6 @@
 pub mod decode;
 pub mod request;
+pub mod session;
 pub mod status;
 
 pub use decode::{
@@ -8,6 +9,10 @@ pub use decode::{
 };
 pub use request::{
     BLOCKS_META_FILTER, StreamFilter, TRANSACTIONS_FILTER, commitment_level, ping_request,
+};
+pub use session::{
+    GeyserChannel, GeyserDial, GrpcSession, GrpcSettings, NetworkDial, STALE_AFTER,
+    SessionEvent, XToken,
 };
 pub use status::{
     ExitClass, GrpcExitReason, PendingRequest, RATE_LIMIT_COOL_DOWN,

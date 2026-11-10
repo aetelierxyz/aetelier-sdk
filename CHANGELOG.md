@@ -32,6 +32,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `aetelier_io::onchain::read_transaction_keys` and `LeafKeys`.
 - Cargo feature `grpc` in `aetelier-connect` and `aetelier-sdk`, off by default: `yellowstone-grpc-client` 17 and `yellowstone-grpc-proto` 14.0.1, with `TransactionError` decoded through `wincode`.
 - `framework::grpc`: the full Yellowstone subscribe request (one transaction filter over every watched address, `blocks_meta`, explicit commitment, never `from_slot`) and ping-only requests, checked against `account_include_max` and `account_include_reject`; `classify_status` with retryable, rate-limited, terminal and rejected-update outcomes, terminal statuses staying terminal after data; `SubscribeUpdate` decoding into the on-chain transaction input and slot-book block meta, keeping undecodable error bytes.
+- `framework::grpc::GrpcSession`: one Yellowstone subscription opened with its full request first, each subscribe and filter update acknowledged by a ping, server pings answered, client pings on `ping_interval_secs` for the round trip, a 10 s `blocks_meta` staleness bound and per-connection receipt stamps; `GrpcSettings` (TLS with native roots, x-token, zstd, decode limit, HTTP/2 keepalive) and the `GeyserDial` connect seam with `NetworkDial`.
 
 ### Changed
 
