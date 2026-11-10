@@ -103,6 +103,7 @@ dependencies = [
  "chrono",
  "clap",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

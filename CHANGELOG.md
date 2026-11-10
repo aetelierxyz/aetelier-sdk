@@ -44,6 +44,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `FeedSet::mark_all_reconnecting` and `mark_all_subscribing` leave feeds already in the target state unchanged.
 - `validate` walks `<exchange>/<market_type>/<datatype>/<binding_id>/<YYYY-MM-DD>/` leaves as well as `<exchange>/<datatype>/`, takes a leaf's files from its `index.jsonl` when present, and counts pending files and torn index lines. T11 checks `(address, signature)` across the files of a leaf day.
 - CI runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in the gate and portability jobs, audits that dependency graph with `cargo deny`, and runs `cargo check --all-features`.
+- `md_worker` installs the rustls `ring` provider as the process default before it builds any worker.
 
 ### Fixed
 

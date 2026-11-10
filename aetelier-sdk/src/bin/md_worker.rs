@@ -56,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
         .with_thread_ids(false)
         .init();
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let manifest = MarketWorkerManifest::from_toml(&cli.config)?;
     let configs = manifest.resolve_admitted()?;
