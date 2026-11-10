@@ -30,6 +30,8 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `MarketSynchronizer::slot_driven`, `on_transaction` and `on_slot_tick`: a chain-time grid whose emission hold-back is measured in chain time.
 - `GapIncident::from_slot_gap`, `ExchangeAdapter::replay_stream` and `ReplayFrame`.
 - `aetelier_io::onchain::read_transaction_keys` and `LeafKeys`.
+- Cargo feature `grpc` in `aetelier-connect` and `aetelier-sdk`, off by default: `yellowstone-grpc-client` 17 and `yellowstone-grpc-proto` 14.0.1, with `TransactionError` decoded through `wincode`.
+- `framework::grpc`: the full Yellowstone subscribe request (one transaction filter over every watched address, `blocks_meta`, explicit commitment, never `from_slot`) and ping-only requests, checked against `account_include_max` and `account_include_reject`; `classify_status` with retryable, rate-limited, terminal and rejected-update outcomes, terminal statuses staying terminal after data; `SubscribeUpdate` decoding into the on-chain transaction input and slot-book block meta, keeping undecodable error bytes.
 
 ### Changed
 
@@ -41,6 +43,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `Feed`, `FeedSet` and `SourceRuntime` liveness are keyed by `Instrument`; `Feed::new` takes any `Into<Instrument>`; feed snapshots keep the `BASE/QUOTE` string.
 - `FeedSet::mark_all_reconnecting` and `mark_all_subscribing` leave feeds already in the target state unchanged.
 - `validate` walks `<exchange>/<market_type>/<datatype>/<binding_id>/<YYYY-MM-DD>/` leaves as well as `<exchange>/<datatype>/`, takes a leaf's files from its `index.jsonl` when present, and counts pending files and torn index lines. T11 checks `(address, signature)` across the files of a leaf day.
+- CI runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in the gate and portability jobs, audits that dependency graph with `cargo deny`, and runs `cargo check --all-features`.
 
 ### Fixed
 

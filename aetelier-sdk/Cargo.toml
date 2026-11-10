@@ -16,7 +16,7 @@ include = ["katex-header.html", "Cargo.toml", "LICENSE", "README.md", "src/**/*"
 publish = false
 
 [package.metadata.docs.rs]
-features = ["parquet"]
+features = ["parquet", "grpc"]
 rustdoc-args = ["--html-in-header", "katex-header.html"]
 
 [lib]
@@ -68,6 +68,7 @@ tempfile = "3"
 default = []
 
 connect = ["aetelier-io/connect"]
+grpc = ["aetelier-connect/grpc"]
 parquet = [
   "aetelier-connect/parquet",
   "aetelier-io/connect",

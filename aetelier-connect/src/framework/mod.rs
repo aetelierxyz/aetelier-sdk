@@ -23,6 +23,8 @@ pub mod checksum;
 pub mod driver;
 pub mod entrepot;
 pub mod feed;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 pub mod model;
 pub mod onchain;
 pub mod protocol;

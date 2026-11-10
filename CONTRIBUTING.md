@@ -6,13 +6,15 @@ Contributions are welcome. A change is ready for review when the full local gate
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --features aetelier-sdk/parquet -- -D warnings
+cargo clippy --workspace --all-targets --features aetelier-sdk/parquet,aetelier-sdk/grpc -- -D warnings
 cargo nextest run --workspace
 cargo nextest run --workspace --features aetelier-sdk/parquet
+cargo nextest run --workspace --features aetelier-sdk/parquet,aetelier-sdk/grpc
 cargo test --workspace --doc
 cargo doc --workspace --no-deps
 ```
 
-The parquet legs matter: feature-gated code compiles only there. The conformance suite (`cargo test -p aetelier-connect --test conformance --features parquet`) replays every venue's captured wire frames through the production decode path — a change that breaks any certified venue fails the matrix. Doc tests include every README code block, so documentation cannot drift from the API.
+The parquet and grpc legs matter: feature-gated code compiles only there. The conformance suite (`cargo test -p aetelier-connect --test conformance --features parquet`) replays every venue's captured wire frames through the production decode path — a change that breaks any certified venue fails the matrix. Doc tests include every README code block, so documentation cannot drift from the API.
 
 Tests follow the workspace testing tiers: unit tests ride their modules, integration tests live in each crate's consolidated `tests/` binary, and venue conformance is fixture-replay only — real captured frames, never synthesized ones.
 
