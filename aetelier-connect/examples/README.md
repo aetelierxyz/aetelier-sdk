@@ -1,6 +1,6 @@
 # Examples
 
-Every example runs against live public venue endpoints — no API keys, no accounts, no configuration beyond the command line. Commands run from the workspace root.
+Every example except `capture_grpc` runs against live public venue endpoints — no API keys, no accounts, no configuration beyond the command line. Commands run from the workspace root. `capture_grpc` reads a Yellowstone gRPC provider token from the variable named by `--x-token-env` (default `GRPC_X_TOKEN`).
 
 ## framework_live — the 60-second quickstart
 
@@ -72,6 +72,23 @@ Records raw WebSocket frames to JSONL through each venue's production protocol h
 
 ```
 cargo run -p aetelier-connect --example capture_fixture -- binance BTCUSDT 60 /tmp/binance_capture.jsonl
+```
+
+Runtime: as requested.
+
+## capture_grpc — raw Yellowstone gRPC capture
+
+Subscribes with the production request (the transaction and `blocks_meta` filters, explicit commitment, never `from_slot`) and records every raw `SubscribeUpdate` to JSONL, one line per message, with its receipt time in microseconds and the message bytes in standard base64:
+
+```
+{"t_us":<receipt µs>,"upd":"<base64 of the raw SubscribeUpdate>"}
+{"t_us":<µs>,"reconnect":true}
+```
+
+The second line marks the resubscribe at tip that `--reconnect-after <seconds>` forces once. Without addresses the capture is unfiltered; `--votes` keeps vote transactions. A stream status ends the capture with that status. Needs the `grpc` feature.
+
+```
+GRPC_X_TOKEN=<token> cargo run -p aetelier-connect --example capture_grpc --features grpc -- --endpoint https://solana-yellowstone-grpc.publicnode.com:443 --seconds 60 --out /tmp/solana_capture.jsonl JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
 ```
 
 Runtime: as requested.

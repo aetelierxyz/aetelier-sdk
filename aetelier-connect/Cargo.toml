@@ -29,6 +29,11 @@ name = "capture_fixture"
 path = "examples/capture_fixture.rs"
 
 [[example]]
+name = "capture_grpc"
+path = "examples/capture_grpc.rs"
+required-features = ["grpc"]
+
+[[example]]
 name = "framework_live"
 path = "examples/framework_live/framework_live.rs"
 
@@ -213,6 +218,7 @@ yellowstone-grpc-proto = { version = "14.0.1", optional = true }
 
 [dev-dependencies]
 aetelier-io = { path = "../aetelier-io", features = ["parquet"] }
+base64 = { version = "0.22" }
 futures = { version = "0.3" }
 hyper-util = { version = "0.1", features = ["tokio"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["frame", "std"] }

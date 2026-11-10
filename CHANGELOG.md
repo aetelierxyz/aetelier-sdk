@@ -37,6 +37,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `GrpcAttach`, `drive_grpc` and `SourceMetrics::set_conn_epoch_us`.
 - The `solana` venue under feature `grpc`: market type `onchain`, datatype `transactions`, `production` and `testnet`, a 2 s chain-time emission delay, live workers attached through `framework::grpc::GrpcConnections`, and `replay_stream` over captured `SubscribeUpdate` frames.
 - `MarketWorker::with_grpc_connections`.
+- Example `capture_grpc` (feature `grpc`): raw Yellowstone `SubscribeUpdate` bytes as base64 JSON lines with receipt times and reconnect markers.
 
 ### Changed
 

@@ -72,3 +72,12 @@ in-band REQ is sent mid-stream by the capture bin (at t≈6s) for the same reaso
 Bitso is L3 (order-keyed, seeded 0-based), so its REST snapshot is
 alignment-immune.
 
+Solana captures come from `examples/capture_grpc` (feature `grpc`), which
+records raw Yellowstone gRPC `SubscribeUpdate` bytes through the production
+subscribe request and reads the provider token from the variable named by
+`--x-token-env` (default `GRPC_X_TOKEN`):
+
+```
+GRPC_X_TOKEN=<token> cargo run -p aetelier-connect --example capture_grpc --features grpc -- --endpoint https://solana-yellowstone-grpc.publicnode.com:443 --seconds 60 --out /tmp/solana_capture.jsonl JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
+```
+
