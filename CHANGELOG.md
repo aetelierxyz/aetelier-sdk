@@ -38,6 +38,9 @@ entry is edited only to correct a factual error, never to restate its scope.
 - The `solana` venue under feature `grpc`: market type `onchain`, datatype `transactions`, `production` and `testnet`, a 2 s chain-time emission delay, live workers attached through `framework::grpc::GrpcConnections`, and `replay_stream` over captured `SubscribeUpdate` frames.
 - `MarketWorker::with_grpc_connections`.
 - Example `capture_grpc` (feature `grpc`): raw Yellowstone `SubscribeUpdate` bytes as base64 JSON lines with receipt times and reconnect markers.
+- Solana captures in `aetelier-connect/datasets/solana/`: eight whole-slot windows of raw `SubscribeUpdate` bytes from publicnode, covering finalized and confirmed, filtered and unfiltered, a quiet address and a resubscribe at tip, with provenance in `datasets/README.md`.
+- The `solana` conformance suite under feature `grpc`, on those captures (`done: true`): kinds `tx_decode_surface`, `slot_assembly`, `slot_reorder`, `tx_dedup`, `slot_gap_detection`, `slot_tick_grid`, `shared_connection_fanout`, `address_match_roles`, `failed_inclusion` and `tx_invariants`, not applicable on the 13 CEX venues.
+- Atlas ids `DAT-TX-INV-1` to `DAT-TX-INV-4`, `DAT-SB-INV-1`, `DAT-SB-INV-2`, `DAT-SB-T-1`, `DAT-SB-T-2` and `DAT-SY-INV-25` in `framework::atlas::ENFORCED` under feature `grpc`.
 
 ### Changed
 
@@ -55,6 +58,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `md_worker` starts `transport = "grpc"` workers without the 250 ms startup stagger.
 - `md_worker` with `RUST_LOG` unset logs at `info` with the `rustls` targets off; an explicit `RUST_LOG` is used as given.
 - The release workflow runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in its gates and builds the released `md_worker`, `validate` and `rehydrate` binaries with `--features parquet,grpc`; `md_worker.Dockerfile` builds `md_worker` with `--features parquet,grpc`.
+- `VenueConformance` gains `expect_instrument` and `stream_fixtures`, with a loader for `{"t_us","upd"}` and `{"t_us","reconnect":true}` lines; `symbol_canonicalization` checks `decode_instrument`, `feed_lifecycle` replays stream venues through `replay_stream`, and `datatype_isolation` is not applicable on single-datatype venues.
 
 ### Fixed
 

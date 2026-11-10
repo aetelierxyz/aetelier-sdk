@@ -30,6 +30,24 @@ pub const ENFORCED: &[&str] = &[
     "DAT-RC-INV-4",  // recovery counters never rewrite loss accounting
     "DAT-F-T-3",
     "DAT-F-INV-4",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-1",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-2",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-3",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-4",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-INV-1",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-INV-2",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-T-1",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-T-2",
+    #[cfg(feature = "grpc")]
+    "DAT-SY-INV-25",
 ];
 
 /// `SourceMetrics` snapshot field -> the invariant id(s) that counter

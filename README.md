@@ -116,7 +116,7 @@ Thirteen venues run the same certified framework path — twelve spot plus hyper
 
 Its manifest sets `market_type = "onchain"`, `transport = "grpc"` with a `[collect.grpc]` section (`endpoint`; `x_token_env` names the variable holding the provider's token when it needs one), `[collect.datatypes.transactions]`, and `sync_mode = "on_slot"`, which advances the grid on chain time. Every subscribe starts at the chain tip, so an outage is recorded as one exact slot gap in the gap ledger and is not backfilled.
 
-`Protocol` is the pinned `yellowstone-grpc-proto` release; a rejected gRPC status names it alongside the server's version. `Stream` keeps no book. No captured fixtures are committed for `solana`, so the conformance matrix does not certify it.
+`Protocol` is the pinned `yellowstone-grpc-proto` release; a rejected gRPC status names it alongside the server's version. `Stream` keeps no book. With `grpc`, the conformance matrix certifies `solana` on Yellowstone captures committed under `aetelier-connect/datasets/solana/` (finalized and confirmed windows, a quiet address, a forced reconnect, an unfiltered window): transaction decoding, slot assembly and reorder, duplicate suppression, the exact slot gap, the slot-driven grid, address match roles, failed-transaction inclusion and the `transactions.v1` record checks.
 
 ## Data honesty
 

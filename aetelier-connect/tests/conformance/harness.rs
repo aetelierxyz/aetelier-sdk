@@ -11,7 +11,10 @@
 //! failure.
 
 use aetelier_connect::framework::model::SnapshotSource;
-use aetelier_connect::framework::registry::registry;
+use aetelier_connect::framework::registry::{ReplayFrame, registry};
+use aetelier_types::onchain::{Chain, Commitment};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 
 /// The seeding-snapshot source a venue's documentation declares. This is the
 /// one expectation the harness cannot read from code — it is what the code is
@@ -76,6 +79,34 @@ pub struct VenueConformance {
     /// (C1 of the datatype-isolation plan). Until true, the
     /// `datatype_isolation` kind reports NotApplicable for the venue.
     pub datatype_isolation_done: bool,
+    pub expect_instrument: ExpectInstrument,
+    pub stream_fixtures: &'static [StreamFixture],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+pub enum ExpectInstrument {
+    Pair,
+    Address(Chain),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectGap {
+    pub prev_slot: u64,
+    pub prev_height: u64,
+    pub next_slot: u64,
+    pub next_height: u64,
+}
+
+#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+pub struct StreamFixture {
+    pub file: &'static str,
+    pub watched: &'static str,
+    pub commitment: Commitment,
+    pub unfiltered: Option<&'static str>,
+    pub rows: usize,
+    pub ticks: usize,
+    pub gaps: &'static [ExpectGap],
 }
 
 /// The outcome of running one kind against one venue.
@@ -133,6 +164,45 @@ pub fn fixture_raw(rel: &str) -> Result<String, String> {
         .join("datasets")
         .join(rel);
     std::fs::read_to_string(&path).map_err(|e| format!("fixture {rel} unreadable: {e}"))
+}
+
+pub fn stream_frames(rel: &str) -> Result<Vec<ReplayFrame>, String> {
+    let lines = fixture_lines(rel)?;
+    if lines.is_empty() {
+        return Err(format!("fixture {rel} has no frames"));
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            stream_frame(line).map_err(|e| format!("fixture {rel} line {}: {e}", i + 1))
+        })
+        .collect()
+}
+
+pub fn stream_frame(line: &str) -> Result<ReplayFrame, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FrameLine {
+        t_us: u64,
+        upd: Option<String>,
+        reconnect: Option<bool>,
+    }
+    let parsed: FrameLine = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    match (parsed.upd, parsed.reconnect) {
+        (Some(upd), None) => STANDARD
+            .decode(upd)
+            .map(|bytes| ReplayFrame::Update {
+                t_us: parsed.t_us,
+                bytes,
+            })
+            .map_err(|e| format!("upd is not standard base64: {e}")),
+        (None, Some(true)) => Ok(ReplayFrame::Reconnect { t_us: parsed.t_us }),
+        _ => Err(
+            "a frame line carries exactly one of \"upd\" or \"reconnect\": true"
+                .to_string(),
+        ),
+    }
 }
 
 /// Assert a kind's outcome for a venue: Pass and Skip are acceptable; Fail

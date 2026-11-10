@@ -1,10 +1,10 @@
 # aetelier datasets
 
-Small, real captures of exchange wire data — the reproducible ground truth the
-test suite replays. Every file here is bytes an exchange actually sent (public
-market data, no credentials), captured over the venue's real protocol, trimmed
-to a snapshot-anchored window, and committed so anyone can reproduce the tests
-against the exact same input.
+Small, real captures of exchange and Solana wire data — the reproducible ground
+truth the test suite replays. Every file here is bytes a venue actually sent
+(public market or chain data, no credentials), captured over the venue's real
+protocol, trimmed to a snapshot- or slot-anchored window, and committed so
+anyone can reproduce the tests against the exact same input.
 
 ## Why these exist
 
@@ -80,4 +80,44 @@ subscribe request and reads the provider token from the variable named by
 ```
 GRPC_X_TOKEN=<token> cargo run -p aetelier-connect --example capture_grpc --features grpc -- --endpoint https://solana-yellowstone-grpc.publicnode.com:443 --seconds 60 --out /tmp/solana_capture.jsonl JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
 ```
+
+The `solana/` files were captured on 2026-11-10 from
+`https://solana-yellowstone-grpc.publicnode.com:443` in this way, one
+subscription per file. Each request has one transaction filter (`vote: false`,
+failed transactions kept, the watched address in `account_include`, or no
+address for the unfiltered file), `blocks_meta`, an explicit commitment, and no
+`from_slot`. Each file is a window of whole slots cut from a longer capture: it
+keeps every transaction update and `blocks_meta` of its slots and drops pings
+and pongs. Replay opens coverage two slots after the first input slot, so the
+first two slots of each file emit no rows. In `unfiltered_finalized.jsonl` and
+`jupiter_v6_paired_finalized.jsonl`, those two lead-in slots keep only their
+`blocks_meta`. The longer windows they were cut from (600 s per address, 60 s
+unfiltered, and a forced resubscribe) are kept outside the repository. No file
+holds a token.
+
+| File | Filter | Commitment | Slots | Tx / meta / reconnect | Size | sha256 |
+|---|---|---|---|---:|---:|---|
+| `solana/jupiter_v6_finalized.jsonl` | `JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4` (Jupiter Aggregator v6) | finalized | 467624000–467624013 | 58 / 14 / 0 | 964K | `c866a10b0521dd40d7bac82121d047c6d41b4499e35220052a08383ff3d4271f` |
+| `solana/jupiter_v6_confirmed.jsonl` | Jupiter Aggregator v6 | confirmed | 467626900–467626919 | 65 / 20 / 0 | 908K | `765176f49da1a940b70037568132d97b4dbf0825dca7afe7823bf3f3f5b9b6d1` |
+| `solana/raydium_amm_v4_finalized.jsonl` | `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` (Raydium AMM v4 program) | finalized | 467624000–467624049 | 91 / 50 / 0 | 988K | `f83cf93e3dadf7becc248dc66947a63d131dc38e15370ab96bcaa2c10b72dc6c` |
+| `solana/raydium_sol_usdc_pool_finalized.jsonl` | `58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2` (Raydium AMM v4 SOL/USDC pool) | finalized | 467624000–467624049 | 39 / 50 / 0 | 508K | `d40f283dd31678732a3983ac2888165e7d833b8ad1b1ca686283c99394062abf` |
+| `solana/raydium_sol_usdc_pool_reconnect_finalized.jsonl` | Raydium AMM v4 SOL/USDC pool, resubscribed at tip once (`--reconnect-after 90`) | finalized | 467627245–467627285, slots 467627261–467627263 lost | 59 / 40 / 1 | 688K | `c11ce73aeb27fbc9e789ef4d598eece6e131ff18efb3de0c82de8b59a154f6bd` |
+| `solana/config_program_quiet_finalized.jsonl` | `Config1111111111111111111111111111111111111` (quiet address) | finalized | 467624000–467624049 | 0 / 50 / 0 | 20K | `0aec67c552f0e14764aba3e04528ac78e0a8ca676d17f940f8a9476e22f69178` |
+| `solana/unfiltered_finalized.jsonl` | none | finalized | 467626650–467626652 | 163 / 3 / 0 | 844K | `eb43d2494d36f6bf061a18a5678d9b85e2eb2bafd8ca63e9ebfd32a920260022` |
+| `solana/jupiter_v6_paired_finalized.jsonl` | Jupiter Aggregator v6, the same slots as the unfiltered file | finalized | 467626650–467626652 | 10 / 3 / 0 | 152K | `751d46869a48e1a4c252c467ccc7175be9cf3f70a9e3fea1c9c116a1e06f0afe` |
+
+In the longer captures:
+- Every filtered stream held exactly the transactions of the unfiltered stream
+  over the same slots that name its address, including addresses that appear
+  only through address lookup tables.
+- The unfiltered stream matched `executed_transaction_count` on every inner
+  slot.
+- No vote transaction appeared with the vote filter off.
+- Banks arrived in slot order at both commitments, with no child bank before
+  its parent.
+- `fee_lamports` equals 5000 lamports per signature plus the priority fee.
+  The priority fee is `priority_fee_lamports` on v1, and on legacy and v0 the
+  ceiling of price × limit / 10⁶. A legacy or v0 transaction without a limit
+  instruction pays on the runtime's default limit, and precompile signatures
+  count as signatures.
 
