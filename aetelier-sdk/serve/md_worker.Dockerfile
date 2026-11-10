@@ -51,7 +51,7 @@ RUN mkdir -p aetelier-sdk/aetelier-sdk/src \
     && echo 'fn main(){}' > aetelier-sdk/aetelier-sdk/src/bin/md_worker.rs
 
 RUN cd aetelier-sdk && cargo build --release \
-        -p aetelier-sdk --bin md_worker --features parquet 2>/dev/null || true
+        -p aetelier-sdk --bin md_worker --features parquet,grpc 2>/dev/null || true
 
 # Real source.
 COPY aetelier-sdk/    aetelier-sdk/
@@ -61,7 +61,7 @@ RUN find aetelier-sdk -type f \
         \( -name "*.rs" -o -name "Cargo.toml" \) -exec touch {} +
 
 RUN cd aetelier-sdk && cargo build --release \
-        -p aetelier-sdk --bin md_worker --features parquet \
+        -p aetelier-sdk --bin md_worker --features parquet,grpc \
     && strip target/release/md_worker
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ let trade = Trade::builder()
 assert_eq!(trade.pair.to_canonical(), "BTC/USDT");
 ```
 
-The `parquet` feature forwards to `aetelier-io` and unlocks the persistence re-exports. The `md_worker` binary in this crate is the config-driven collector: a TOML manifest in, grid-synchronized Parquet files out.
+The `parquet` feature forwards to `aetelier-io` and unlocks the persistence re-exports. The `grpc` feature forwards to `aetelier-connect/grpc` and compiles in the `solana` venue, on-chain transactions over Yellowstone gRPC. Both are off by default; the `md_worker`, `validate` and `rehydrate` binaries attached to each release, and the image from `serve/md_worker.Dockerfile`, are built with `parquet,grpc`. The `md_worker` binary in this crate is the config-driven collector: a TOML manifest in, grid-synchronized Parquet files out.
 
 ## Facade policy
 

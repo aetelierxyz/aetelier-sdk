@@ -54,6 +54,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 - A `transport = "grpc"` worker ends only on a terminal rejection (feeds `Rejected`, state `Disconnected`), a stop or a shutdown; outages reach it as connection-state events and slot gaps, never as a wall-clock gap incident. A stop, restart or shutdown inside a bank finishes that bank within the stop drain bound; a bank it cannot finish, or one cut by a pause, closes the feeds `partial`.
 - `md_worker` starts `transport = "grpc"` workers without the 250 ms startup stagger.
 - `md_worker` with `RUST_LOG` unset logs at `info` with the `rustls` targets off; an explicit `RUST_LOG` is used as given.
+- The release workflow runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in its gates and builds the released `md_worker`, `validate` and `rehydrate` binaries with `--features parquet,grpc`; `md_worker.Dockerfile` builds `md_worker` with `--features parquet,grpc`.
 
 ### Fixed
 
