@@ -22,7 +22,7 @@ use crate::framework::budget::SourceMetrics;
 use crate::framework::onchain::ReceiptStamp;
 use crate::framework::transport::rtt_ewma_us;
 
-pub const STALE_AFTER: Duration = Duration::from_secs(10);
+pub const STALE_AFTER: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn settings_follow_the_grpc_section() {
-        assert_eq!(STALE_AFTER, Duration::from_secs(10));
+        assert_eq!(STALE_AFTER, Duration::from_secs(30));
         let token = XToken::new(TOKEN.to_string());
         assert_eq!(
             GrpcSettings::new(&section(), Some(token.clone())),
@@ -1031,7 +1031,7 @@ mod tests {
         );
         let started = Instant::now();
         let feeder = tokio::spawn(async move {
-            for slot in 1..=40u64 {
+            for slot in 1..=80u64 {
                 sleep_until(started + Duration::from_millis(500 * slot)).await;
                 let update = if slot == 6 {
                     meta(slot)
@@ -1050,7 +1050,7 @@ mod tests {
                 Err(exit) => break exit,
             }
         };
-        assert_eq!(started.elapsed(), Duration::from_secs(13));
+        assert_eq!(started.elapsed(), Duration::from_secs(3) + STALE_AFTER);
         assert!(
             matches!(exit, GrpcExitReason::Stale { silence } if silence == STALE_AFTER),
             "{exit:?}"

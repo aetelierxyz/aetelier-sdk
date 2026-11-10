@@ -442,7 +442,7 @@ async fn a_failed_ping_write_reconnects_at_tip_after_one_backoff() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn ten_seconds_without_block_meta_reconnect_at_tip() {
+async fn thirty_seconds_without_block_meta_reconnect_at_tip() {
     let mock = MockGeyser::default();
     let (pool, dial) = duplex_pool(&mock);
     let chain = Chain::recent();
@@ -450,7 +450,7 @@ async fn ten_seconds_without_block_meta_reconnect_at_tip() {
     let connection = delivering(&mock, &chain, &mut a).await;
     let first = connection.first_request().clone();
     let quiet_from = Instant::now();
-    let lost = within(&mut a, 11).await;
+    let lost = within(&mut a, 31).await;
     assert_eq!(Instant::now() - quiet_from, STALE_AFTER);
     assert!(
         lost_reason(&lost).starts_with("stale connection"),
