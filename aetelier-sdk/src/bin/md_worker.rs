@@ -30,6 +30,7 @@ use clap::Parser;
 use tokio::{sync::watch, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 
+use aetelier_connect::config::workers::market_worker_config::TransportKind;
 use aetelier_connect::config::workers::{MarketWorkerConfig, MarketWorkerManifest};
 use aetelier_connect::workers::market_worker::MarketWorker;
 
@@ -105,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     for (i, cfg) in configs.into_iter().enumerate() {
         let rx = shutdown_rx.clone();
         let label = format!("{}:{}", cfg.common.exchange, cfg.common.symbol);
+        let grpc = cfg.transport == TransportKind::Grpc;
 
         // Build the worker, wiring a `ParquetSnapshotFlusher` when the
         // `parquet` feature is enabled. Without the flusher, any
@@ -120,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
         );
 
         // Stagger startup to avoid thundering-herd on exchange endpoints.
-        if i > 0 {
+        if i > 0 && !grpc {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 

@@ -1691,6 +1691,10 @@ mod tests {
             assert_eq!(model.book_level(), level, "{}", model.class_label());
         }
         for (id, adapter) in crate::framework::registry::registry() {
+            let exchange: aetelier_types::exchanges::Exchange = id.parse().unwrap();
+            if exchange.chain().is_some() {
+                continue;
+            }
             let model = adapter.book_model("orders");
             assert!(model.reconstructs_books(), "{id}");
             assert_ne!(model.book_level(), "none", "{id}");

@@ -713,6 +713,7 @@ mod tests {
 
     const PUBLICNODE: &str = "https://solana-yellowstone-grpc.publicnode.com:443";
 
+    #[cfg(not(feature = "grpc"))]
     const GRPC_FEATURE: &str =
         "venue 'solana' needs the `grpc` feature: this build registers no solana adapter";
 
@@ -808,6 +809,13 @@ symbol = "{JUPITER_V6}"
             Err(ConnectError::Build(reason)) => reason,
             other => panic!("expected a Build refusal, got {other:?}"),
         }
+    }
+
+    fn assert_admitted_or_names_the_grpc_feature(config: &MarketWorkerConfig) {
+        #[cfg(feature = "grpc")]
+        assert!(config.admit().is_ok(), "{:?}", config.admit());
+        #[cfg(not(feature = "grpc"))]
+        assert_eq!(refusal(config), GRPC_FEATURE);
     }
 
     fn grpc_defaults() -> GrpcSection {
@@ -1449,6 +1457,7 @@ symbol = "BTCUSDT"
         assert!(!m.resolve_all()[0].framework_ingest);
     }
 
+    #[cfg(not(feature = "grpc"))]
     #[test]
     fn valid_solana_worker_without_an_adapter_names_the_grpc_feature() {
         let config = resolve(&solana_manifest(""));
@@ -1457,6 +1466,16 @@ symbol = "BTCUSDT"
             config.admit().unwrap_err().to_string(),
             format!("worker build failed: {GRPC_FEATURE}")
         );
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn valid_solana_worker_is_admitted_with_the_grpc_feature() {
+        let manifest = MarketWorkerManifest::from_str(&solana_manifest("")).unwrap();
+        let admitted = manifest.resolve_admitted().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].common.symbol, JUPITER_V6);
+        assert_eq!(admitted[0].transport, TransportKind::Grpc);
     }
 
     #[test]
@@ -1512,7 +1531,7 @@ symbol = "BTCUSDT"
             "[collect.grpc]\n",
             &format!("[collect.grpc]\naccount_include_reject = [\"{SYSTEM_PROGRAM}\"]\n"),
         );
-        assert_eq!(refusal(&resolve(&other)), GRPC_FEATURE);
+        assert_admitted_or_names_the_grpc_feature(&resolve(&other));
     }
 
     #[test]
@@ -1551,7 +1570,7 @@ symbol = "BTCUSDT"
             Err(e) => assert_eq!(e.to_string(), format!("worker build failed: {reason}")),
         }
         let disabled = solana_manifest("\n[collect.reconcile]\nenabled = false\n");
-        assert_eq!(refusal(&resolve(&disabled)), GRPC_FEATURE);
+        assert_admitted_or_names_the_grpc_feature(&resolve(&disabled));
     }
 
     #[test]
@@ -1594,7 +1613,7 @@ symbol = "BTCUSDT"
             config.common.datatypes.transactions.match_role,
             MatchRole::Signer
         );
-        assert_eq!(refusal(&config), GRPC_FEATURE);
+        assert_admitted_or_names_the_grpc_feature(&config);
     }
 
     #[test]
@@ -1608,7 +1627,7 @@ symbol = "BTCUSDT"
                 "environment = \"{environment}\""
             )));
             assert_eq!(config.common.environment, expected);
-            assert_eq!(refusal(&config), GRPC_FEATURE, "{environment}");
+            assert_admitted_or_names_the_grpc_feature(&config);
         }
         let err =
             MarketWorkerManifest::from_str(&solana_manifest("environment = \"devnet\""))
@@ -1897,6 +1916,6 @@ end = "2023-09-16""#;
         let config = resolve(&toml);
         assert!(config.framework_ingest);
         assert_eq!(config.sync.sync_mode, SyncMode::OnSlot);
-        assert_eq!(refusal(&config), GRPC_FEATURE);
+        assert_admitted_or_names_the_grpc_feature(&config);
     }
 }

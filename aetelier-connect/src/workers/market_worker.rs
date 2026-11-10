@@ -156,6 +156,7 @@ pub struct MarketWorker {
     transport: crate::config::workers::market_worker_config::TransportKind,
     /// Replay window when `transport = "entrepot"`.
     entrepot: Option<crate::config::workers::market_worker_config::EntrepotSection>,
+    grpc: GrpcWiring,
     /// Snapshot broadcast handle (`Some` when a Channel sink is configured);
     /// kept so consumers can subscribe to the synchronized stream.
     snapshot_channel: Option<crate::workers::topic_publisher::SnapshotChannel>,
@@ -164,6 +165,24 @@ pub struct MarketWorker {
     gap_ledger: Option<crate::workers::gap_ledger::GapLedger>,
     /// Live-reconciliation settings (`Some` only when enabled + validated).
     reconcile: Option<crate::config::workers::market_worker_config::ReconcileSection>,
+}
+
+struct GrpcWiring {
+    section: Option<crate::config::workers::market_worker_config::GrpcSection>,
+    #[cfg(feature = "grpc")]
+    connections: Option<crate::framework::grpc::GrpcConnections>,
+}
+
+impl GrpcWiring {
+    fn new(
+        section: Option<crate::config::workers::market_worker_config::GrpcSection>,
+    ) -> Self {
+        Self {
+            section,
+            #[cfg(feature = "grpc")]
+            connections: None,
+        }
+    }
 }
 
 impl MarketWorker {
@@ -204,6 +223,7 @@ impl MarketWorker {
         let framework_ingest = config.framework_ingest;
         let transport = config.transport;
         let entrepot = config.entrepot.clone();
+        let grpc = GrpcWiring::new(config.grpc.clone());
         if transport
             == crate::config::workers::market_worker_config::TransportKind::Entrepot
             && entrepot.is_none()
@@ -334,6 +354,7 @@ impl MarketWorker {
             framework_ingest,
             transport,
             entrepot,
+            grpc,
             snapshot_channel,
             gap_ledger,
             reconcile,
@@ -380,6 +401,15 @@ impl MarketWorker {
         for sink in extra {
             self.sinks.push(sink);
         }
+        self
+    }
+
+    #[cfg(feature = "grpc")]
+    pub fn with_grpc_connections(
+        mut self,
+        connections: crate::framework::grpc::GrpcConnections,
+    ) -> Self {
+        self.grpc.connections = Some(connections);
         self
     }
 
@@ -462,6 +492,7 @@ impl MarketWorker {
             framework_ingest: _,
             transport: _,
             entrepot: _,
+            grpc: _,
             snapshot_channel: _,
             gap_ledger: _,
             reconcile: _,
@@ -764,6 +795,7 @@ impl MarketWorker {
             reconcile,
             transport,
             entrepot,
+            grpc,
             ..
         } = self;
 
@@ -848,9 +880,39 @@ impl MarketWorker {
                         })?,
                     )
                 }
+                #[cfg(feature = "grpc")]
+                TransportKind::Grpc => {
+                    let section = grpc.section.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "transport = \"grpc\" requires a [collect.grpc] section"
+                        )
+                    })?;
+                    let connections = grpc
+                        .connections
+                        .clone()
+                        .unwrap_or_else(crate::framework::grpc::GrpcConnections::process);
+                    Some(
+                        crate::framework::grpc::build_grpc_adapter(
+                            core.exchange(),
+                            section,
+                            &core.datatypes().transactions,
+                            core.reconnect_section(),
+                            connections,
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no gRPC adapter exists for venue '{exchange_name}'"
+                            )
+                        })?,
+                    )
+                }
+                #[cfg(not(feature = "grpc"))]
                 TransportKind::Grpc => anyhow::bail!(
                     "transport = \"grpc\" needs the `grpc` feature: this build has no gRPC \
-                     transport"
+                     transport for {}",
+                    grpc.section
+                        .as_ref()
+                        .map_or("[collect.grpc]", |g| g.endpoint.as_str())
                 ),
             };
         let adapter: &dyn crate::framework::registry::ExchangeAdapter =
@@ -1500,6 +1562,20 @@ impl MarketWorker {
                 )
             });
             let outcome = runtime_handle.await.unwrap_or(RuntimeOutcome::Finished);
+            if transport == TransportKind::Grpc {
+                (connection_state, drain_partial) =
+                    stream_attach_ended(&adapter_exit, &feeds, connection_state);
+                if let TaskExit::Failed(reason) = &adapter_exit {
+                    tracing::error!(
+                        exchange = exchange_name.as_str(),
+                        symbol = symbol.as_str(),
+                        state = ?connection_state,
+                        %reason,
+                        "market_worker.stream_ended"
+                    );
+                }
+                break;
+            }
 
             if matches!(adapter_exit, TaskExit::Exhausted) {
                 metrics.mark_source_exhausted();
@@ -1744,6 +1820,31 @@ fn framework_instrument(
     codec.decode_instrument(symbol).ok_or_else(|| {
         anyhow::anyhow!("cannot decode symbol {symbol} for {exchange_name}")
     })
+}
+
+fn stream_attach_ended(
+    exit: &TaskExit,
+    feeds: &crate::framework::feed::SharedFeedSet,
+    state: crate::ConnectionState,
+) -> (crate::ConnectionState, bool) {
+    match exit {
+        TaskExit::Failed(reason) => {
+            if let Ok(mut fs) = feeds.lock() {
+                fs.mark_all_reconnecting();
+                if matches!(
+                    reason,
+                    crate::clients::disconnect::DisconnectReason::ProtocolRejection { .. }
+                ) {
+                    fs.mark_all_rejected(&reason.to_string());
+                } else {
+                    fs.mark_all_failed(&reason.to_string());
+                }
+            }
+            (crate::ConnectionState::Disconnected, false)
+        }
+        TaskExit::DrainTimedOut => (state, true),
+        TaskExit::Completed | TaskExit::Exhausted => (state, false),
+    }
 }
 
 /// Receive the next command, or pend forever when no receiver is attached.
@@ -2672,18 +2773,8 @@ symbol = "BTCUSDT"
         );
     }
 
-    #[test]
-    fn from_config_full_runs_admission() {
-        let onchain = hold_back_manifest(None, false).replace(
-            "exchange = \"binance\"",
-            "exchange = \"bybit\"\nmarket_type = \"onchain\"",
-        );
-        assert_eq!(
-            build_error(&onchain),
-            "worker build failed: venue 'bybit' has no onchain market — set \
-             `market_type` to \"spot\", \"perpetual\" or \"inverse\""
-        );
-        let solana = format!(
+    fn solana_manifest(extra: &str) -> String {
+        format!(
             r#"
 [collect]
 exchange = "solana"
@@ -2692,7 +2783,7 @@ transport = "grpc"
 
 [collect.grpc]
 endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
-
+{extra}
 [collect.datatypes.transactions]
 enabled = true
 
@@ -2707,12 +2798,151 @@ unit = "Secs"
 [[workers]]
 symbol = "{JUPITER_V6}"
 "#
+        )
+    }
+
+    #[test]
+    fn from_config_full_runs_admission() {
+        let onchain = hold_back_manifest(None, false).replace(
+            "exchange = \"binance\"",
+            "exchange = \"bybit\"\nmarket_type = \"onchain\"",
         );
+        assert_eq!(
+            build_error(&onchain),
+            "worker build failed: venue 'bybit' has no onchain market — set \
+             `market_type` to \"spot\", \"perpetual\" or \"inverse\""
+        );
+        let solana = solana_manifest("");
+        #[cfg(not(feature = "grpc"))]
         assert_eq!(
             build_error(&solana),
             "worker build failed: venue 'solana' needs the `grpc` feature: this build \
              registers no solana adapter"
         );
+        #[cfg(feature = "grpc")]
+        {
+            let worker = MarketWorker::from_config(resolve_hold_back(&solana)).unwrap();
+            assert_eq!(worker.sync.emission_delay_us(), 2_000_000);
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn an_explicit_emission_delay_overrides_the_solana_default() {
+        let toml = solana_manifest(
+            "\n[collect.emission_delay]\nvalue = 500\nunit = \"Millis\"\n",
+        );
+        let worker = MarketWorker::from_config(resolve_hold_back(&toml)).unwrap();
+        assert_eq!(worker.sync.emission_delay_us(), 500_000);
+    }
+
+    fn live_solana_feeds() -> crate::framework::feed::SharedFeedSet {
+        use aetelier_types::config::markets::market_config::{
+            DeclaredDatatype, DeclaredSet,
+        };
+        let address = aetelier_types::onchain::ChainAddress::solana(JUPITER_V6).unwrap();
+        let instrument = Instrument::from(address);
+        let feeds = crate::framework::feed::FeedSet::for_declared(
+            Exchange::Solana,
+            &instrument,
+            &DeclaredSet::only(DeclaredDatatype::Transactions),
+        )
+        .into_shared();
+        if let Ok(mut fs) = feeds.lock() {
+            fs.mark_all_subscribing();
+            fs.mark_live(
+                &instrument,
+                crate::framework::feed::FeedDatatype::Transactions,
+            );
+        }
+        feeds
+    }
+
+    fn feed_states(
+        feeds: &crate::framework::feed::SharedFeedSet,
+    ) -> Vec<(crate::framework::feed::FeedState, Option<String>, bool)> {
+        feeds
+            .lock()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .map(|feed| (feed.state, feed.reason, feed.partial))
+            .collect()
+    }
+
+    fn close_feeds(feeds: &crate::framework::feed::SharedFeedSet, partial: bool) {
+        let mut fs = feeds.lock().unwrap();
+        fs.mark_all_draining();
+        fs.mark_all_closed(partial);
+    }
+
+    #[test]
+    fn a_rejected_stream_attach_walks_feeds_to_rejected_without_a_reconnect() {
+        use crate::framework::feed::FeedState;
+        let feeds = live_solana_feeds();
+        let exit = TaskExit::Failed(DisconnectReason::ProtocolRejection {
+            code: 0,
+            reason: "gRPC Unauthenticated: invalid x-token".to_string(),
+        });
+        let (state, partial) =
+            stream_attach_ended(&exit, &feeds, crate::ConnectionState::Streaming);
+        assert_eq!(state, crate::ConnectionState::Disconnected);
+        assert!(!partial);
+        let rejected = vec![(
+            FeedState::Rejected,
+            Some(
+                "protocol rejection (0): gRPC Unauthenticated: invalid x-token"
+                    .to_string(),
+            ),
+            false,
+        )];
+        assert_eq!(feed_states(&feeds), rejected);
+        close_feeds(&feeds, partial);
+        assert_eq!(feed_states(&feeds), rejected);
+    }
+
+    #[test]
+    fn a_failed_stream_attach_walks_feeds_to_failed() {
+        use crate::framework::feed::FeedState;
+        let feeds = live_solana_feeds();
+        let exit = TaskExit::Failed(DisconnectReason::TransportError {
+            source: "gRPC connection ended without an outcome".into(),
+        });
+        let (state, partial) = stream_attach_ended(
+            &exit,
+            &feeds,
+            crate::ConnectionState::Reconnecting { attempt: 2 },
+        );
+        assert_eq!(state, crate::ConnectionState::Disconnected);
+        assert!(!partial);
+        let failed = vec![(
+            FeedState::Failed,
+            Some("transport error: gRPC connection ended without an outcome".to_string()),
+            false,
+        )];
+        assert_eq!(feed_states(&feeds), failed);
+        close_feeds(&feeds, partial);
+        assert_eq!(feed_states(&feeds), failed);
+    }
+
+    #[test]
+    fn a_drained_stream_attach_reports_partial() {
+        use crate::framework::feed::FeedState;
+        let streaming = crate::ConnectionState::Streaming;
+        let feeds = live_solana_feeds();
+        assert_eq!(
+            stream_attach_ended(&TaskExit::DrainTimedOut, &feeds, streaming),
+            (streaming, true)
+        );
+        for exit in [TaskExit::Completed, TaskExit::Exhausted] {
+            assert_eq!(
+                stream_attach_ended(&exit, &feeds, streaming),
+                (streaming, false)
+            );
+        }
+        assert_eq!(feed_states(&feeds), vec![(FeedState::Live, None, false)]);
+        close_feeds(&feeds, true);
+        assert_eq!(feed_states(&feeds), vec![(FeedState::Closed, None, true)]);
     }
 
     #[test]

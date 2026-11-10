@@ -6,3 +6,5 @@ mod connection;
 mod failures;
 #[path = "geyser/server.rs"]
 mod server;
+#[path = "geyser/worker.rs"]
+mod worker;

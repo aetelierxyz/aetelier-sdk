@@ -29,7 +29,7 @@ The conformance suite replays committed wire fixtures through the production
 decode path. It requires no credentials and no network:
 
 ```
-cargo test -p aetelier-connect --test conformance
+cargo test -p aetelier-connect --test conformance --features grpc
 ```
 
 Fixtures and their provenance: `aetelier-connect/datasets/README.md`.

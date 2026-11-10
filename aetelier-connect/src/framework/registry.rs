@@ -229,6 +229,8 @@ fn register_all() -> Vec<&'static dyn ExchangeAdapter> {
         &super::adapters::bitget::BITGET,
         &super::adapters::poloniex::POLONIEX,
         &super::adapters::hyperliquid::HYPERLIQUID,
+        #[cfg(feature = "grpc")]
+        &super::adapters::solana::SOLANA,
     ]
 }
 
@@ -387,14 +389,20 @@ mod tests {
             "poloniex",
             "hyperliquid",
         ];
+        let chain_ids: &[&str] = if cfg!(feature = "grpc") {
+            &["solana"]
+        } else {
+            &[]
+        };
         let reg = registry();
-        assert_eq!(reg.len(), ids.len());
-        for id in ids {
+        assert_eq!(reg.len(), ids.len() + chain_ids.len());
+        for id in ids.iter().chain(chain_ids) {
             let adapter = reg.get(id).unwrap_or_else(|| panic!("{id} not registered"));
-            assert_eq!(adapter.id(), id, "registry key must equal adapter.id()");
-            assert_eq!(adapter.profile().id, id, "profile.id must equal venue id");
+            assert_eq!(adapter.id(), *id, "registry key must equal adapter.id()");
+            assert_eq!(adapter.profile().id, *id, "profile.id must equal venue id");
         }
         assert!(resolve(&ids).is_ok());
+        assert_eq!(resolve(&["solana"]).is_ok(), cfg!(feature = "grpc"));
     }
 
     #[test]
@@ -428,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn only_hyperliquid_declares_a_testnet_deployment() {
+    fn only_hyperliquid_and_solana_declare_a_testnet_deployment() {
         use aetelier_types::exchanges::VenueEnvironment as VE;
         for (id, adapter) in registry() {
             assert!(
@@ -437,7 +445,7 @@ mod tests {
             );
             assert_eq!(
                 adapter.supports_environment(VE::Testnet),
-                *id == "hyperliquid",
+                matches!(*id, "hyperliquid" | "solana"),
                 "{id} testnet support must be declared, never assumed"
             );
         }
@@ -567,6 +575,7 @@ mod tests {
         assert!(err.contains("delivers no orderbook"), "{err}");
     }
 
+    #[cfg(not(feature = "grpc"))]
     #[test]
     fn admit_registered_names_the_grpc_feature_for_solana() {
         use aetelier_types::exchanges::Exchange;
@@ -588,7 +597,11 @@ mod tests {
 
     #[test]
     fn no_cex_adapter_sets_a_default_emission_delay() {
+        use aetelier_types::exchanges::Exchange;
         for (id, adapter) in registry() {
+            if id.parse::<Exchange>().unwrap().chain().is_some() {
+                continue;
+            }
             assert_eq!(adapter.default_emission_delay_us(), None, "{id}");
         }
     }
@@ -630,6 +643,14 @@ mod tests {
         ];
         let metrics = SourceMetrics::default();
         for (id, adapter) in registry() {
+            if id
+                .parse::<aetelier_types::exchanges::Exchange>()
+                .unwrap()
+                .chain()
+                .is_some()
+            {
+                continue;
+            }
             assert!(adapter.book_model("orders").reconstructs_books(), "{id}");
             let err = adapter
                 .replay_stream(

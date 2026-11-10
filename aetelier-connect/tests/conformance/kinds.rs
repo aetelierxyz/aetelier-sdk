@@ -1413,8 +1413,10 @@ fn stream_models_never_reach_replay_frame() {
         Ok(events) => panic!("a stream model replayed {} events", events.len()),
     }
     for (id, adapter) in registry() {
-        assert!(
-            stateless_replay_applies(&adapter.book_model("orders")).is_ok(),
+        let model = adapter.book_model("orders");
+        assert_eq!(
+            stateless_replay_applies(&model).is_ok(),
+            model.reconstructs_books(),
             "{id}"
         );
     }

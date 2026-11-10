@@ -35,6 +35,8 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `framework::grpc::GrpcSession`: one Yellowstone subscription opened with its full request first, each subscribe and filter update acknowledged by a ping, server pings answered, client pings on `ping_interval_secs` for the round trip, a 10 s `blocks_meta` staleness bound and per-connection receipt stamps; `GrpcSettings` (TLS with native roots, x-token, zstd, decode limit, HTTP/2 keepalive) and the `GeyserDial` connect seam with `NetworkDial`.
 - `framework::grpc::GrpcConnections`: gRPC workers attach to one Yellowstone subscription per endpoint, commitment, token variable and shard; the connection owns reconnect at tip, backoff, a connect-attempt limit and the rate-limit cool-down, keeps its slot book across reconnects, covers each attach from two slots after its acknowledgement, fans out per attach through bounded queues, and reports each outage to every attach as `ConnectionLost`, `ConnectionResumed` and one exact `SlotGap`.
 - `GrpcAttach`, `drive_grpc` and `SourceMetrics::set_conn_epoch_us`.
+- The `solana` venue under feature `grpc`: market type `onchain`, datatype `transactions`, `production` and `testnet`, a 2 s chain-time emission delay, live workers attached through `framework::grpc::GrpcConnections`, and `replay_stream` over captured `SubscribeUpdate` frames.
+- `MarketWorker::with_grpc_connections`.
 
 ### Changed
 
@@ -48,6 +50,8 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `validate` walks `<exchange>/<market_type>/<datatype>/<binding_id>/<YYYY-MM-DD>/` leaves as well as `<exchange>/<datatype>/`, takes a leaf's files from its `index.jsonl` when present, and counts pending files and torn index lines. T11 checks `(address, signature)` across the files of a leaf day.
 - CI runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in the gate and portability jobs, audits that dependency graph with `cargo deny`, and runs `cargo check --all-features`.
 - `md_worker` installs the rustls `ring` provider as the process default before it builds any worker.
+- A `transport = "grpc"` worker ends only on a terminal rejection (feeds `Rejected`, state `Disconnected`), a stop or a shutdown; outages reach it as connection-state events and slot gaps, never as a wall-clock gap incident.
+- `md_worker` starts `transport = "grpc"` workers without the 250 ms startup stagger.
 
 ### Fixed
 
