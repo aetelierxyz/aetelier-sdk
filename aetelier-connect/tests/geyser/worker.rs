@@ -246,6 +246,63 @@ async fn settle(connection: &mut MockConnection) {
     while ping_id(&connection.next_request().await).is_none() {}
 }
 
+const BANK_ROWS: u64 = 2_000;
+
+#[derive(Clone, Copy, Debug)]
+enum Halt {
+    Stop,
+    Restart,
+    Shutdown,
+    PauseThenStop,
+}
+
+async fn halted_after(halt: Halt, yields: usize) -> (u64, Stopped) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let mock = MockGeyser::default();
+    let (pool, _dial) = duplex_pool(&mock);
+    let chain = Chain::recent();
+    let mut worker = start(
+        configs(dir.path(), &entry(1, "")).remove(0),
+        &pool,
+        dir.path(),
+    );
+    let mut connection = subscribed(&mock).await;
+    connection.send_all([chain.meta(100), chain.meta(101)]);
+    connection.send_all(chain.bank(102, &[(0, &[address(1)])]));
+    settle(&mut connection).await;
+    worker.until(streamed(2)).await;
+    let watched = [address(1)];
+    let rows: Vec<(u64, &[ChainAddress])> =
+        (0..BANK_ROWS).map(|index| (index, &watched[..])).collect();
+    connection.send_all(chain.bank(103, &rows));
+    for _ in 0..yields {
+        tokio::task::yield_now().await;
+    }
+    let commands: &[WorkerCommand] = match halt {
+        Halt::Stop => &[WorkerCommand::Stop],
+        Halt::Restart => &[WorkerCommand::Restart],
+        Halt::Shutdown => &[],
+        Halt::PauseThenStop => &[WorkerCommand::Pause, WorkerCommand::Stop],
+    };
+    for command in commands {
+        worker
+            .commands
+            .send(command.clone())
+            .await
+            .expect("the worker takes commands");
+    }
+    if commands.is_empty() {
+        worker
+            .stop
+            .send(true)
+            .expect("the worker watches its shutdown");
+    }
+    let stopped = worker.ended().await;
+    drop(connection);
+    let kept = stopped.rows.iter().filter(|row| row.slot == 103).count() as u64;
+    (kept, stopped)
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_solana_worker_streams_rows_into_snapshots_and_ledgers_a_slot_gap_across_a_reconnect()
  {
@@ -564,4 +621,48 @@ async fn a_stop_during_an_outage_detaches_at_once_and_never_redials() {
     sleep(Duration::from_secs(120)).await;
     assert_eq!(dial.dials().len(), 1);
     assert_eq!(mock.subscribes().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_restart_or_shutdown_mid_bank_finishes_the_bank_and_closes_clean() {
+    let mut whole = 0;
+    for halt in [Halt::Stop, Halt::Restart, Halt::Shutdown] {
+        for yields in 0..8 {
+            let (kept, stopped) = halted_after(halt, yields).await;
+            assert!(
+                kept == 0 || kept == BANK_ROWS,
+                "{halt:?} after {yields} yields kept {kept} of {BANK_ROWS} rows"
+            );
+            assert_eq!(
+                states(&stopped.status),
+                Some((ConnectionState::Disconnected, FeedState::Closed))
+            );
+            assert!(
+                !feed(&stopped.status).is_some_and(|feed| feed.partial),
+                "{halt:?} after {yields} yields"
+            );
+            assert!(stopped.ledger.is_empty(), "{:?}", stopped.ledger);
+            whole += usize::from(kept == BANK_ROWS);
+        }
+    }
+    assert!(whole > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bank_cut_by_a_pause_closes_the_feed_partial() {
+    let mut cut = 0;
+    for yields in 0..8 {
+        let (kept, stopped) = halted_after(Halt::PauseThenStop, yields).await;
+        assert_eq!(
+            states(&stopped.status),
+            Some((ConnectionState::Disconnected, FeedState::Closed))
+        );
+        let partial = feed(&stopped.status).is_some_and(|feed| feed.partial);
+        assert!(
+            partial || kept == 0 || kept == BANK_ROWS,
+            "a pause after {yields} yields kept {kept} of {BANK_ROWS} rows"
+        );
+        cut += usize::from(kept > 0 && kept < BANK_ROWS);
+    }
+    assert!(cut > 0);
 }

@@ -4,9 +4,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use aetelier_types::onchain::{ChainAddress, Commitment};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use super::attach::GrpcAttach;
-use super::connection::{Command, ConnectionContext, NewAttach, SharedGrpcConnection};
+use super::connection::{
+    Command, ConnectionContext, NewAttach, ReconnectGate, SharedGrpcConnection,
+};
 use super::session::{GeyserDial, GrpcSettings, NetworkDial, XToken};
 use crate::config::workers::common::ReconnectSection;
 use crate::config::workers::market_worker_config::GrpcSection;
@@ -89,9 +92,11 @@ impl GrpcConnections {
             .validate()
             .map_err(|reason| AttachError::InvalidSection { reason })?;
         let mut state = self.inner.lock();
+        let PoolState { groups, gates } = &mut *state;
+        let now = Instant::now();
+        gates.retain(|_, gate| Arc::strong_count(gate) > 1 || gate.holds(now));
         let group_key = group_key(&section);
-        if state
-            .groups
+        if groups
             .get(&group_key)
             .is_some_and(|group| group.section != section)
         {
@@ -107,7 +112,7 @@ impl GrpcConnections {
         if queue_banks == 0 {
             return Err(AttachError::NoQueue);
         }
-        let group = state.groups.entry(group_key).or_insert_with(|| ShardGroup {
+        let group = groups.entry(group_key).or_insert_with(|| ShardGroup {
             section: section.clone(),
             shard_size: section.shard_size(),
             shards: Vec::new(),
@@ -137,11 +142,12 @@ impl GrpcConnections {
             reconnect,
             connect_rate,
         };
-        let spawn = |attach: NewAttach| {
+        let spawn = |attach: NewAttach, gate: &Arc<ReconnectGate>| {
             SharedGrpcConnection::spawn(
                 key.clone(),
                 context,
                 self.inner.dial.clone(),
+                gate.clone(),
                 attach,
             )
         };
@@ -153,15 +159,19 @@ impl GrpcConnections {
                     slot.connection.send(Command::Attach(attach))
                 };
                 if let Err(Command::Attach(attach)) = refused {
-                    slot.connection = spawn(attach);
+                    slot.connection = spawn(attach, &slot.gate);
                 }
                 slot
             }
-            empty => empty.insert(ShardSlot {
-                connection: spawn(attach),
-                attaches: 0,
-                addresses: 0,
-            }),
+            empty => {
+                let gate = gates.remove(&key).unwrap_or_default();
+                empty.insert(ShardSlot {
+                    connection: spawn(attach, &gate),
+                    gate,
+                    attaches: 0,
+                    addresses: 0,
+                })
+            }
         };
         slot.attaches += 1;
         if placed {
@@ -225,6 +235,7 @@ impl PoolInner {
 #[derive(Default)]
 struct PoolState {
     groups: HashMap<(String, Commitment, Option<String>), ShardGroup>,
+    gates: HashMap<ConnectionKey, Arc<ReconnectGate>>,
 }
 
 struct ShardGroup {
@@ -254,6 +265,7 @@ impl ShardGroup {
 
 struct ShardSlot {
     connection: SharedGrpcConnection,
+    gate: Arc<ReconnectGate>,
     attaches: usize,
     addresses: usize,
 }
@@ -268,12 +280,13 @@ pub(crate) struct DetachGuard {
 impl Drop for DetachGuard {
     fn drop(&mut self) {
         let mut state = self.inner.lock();
+        let PoolState { groups, gates } = &mut *state;
         let group_key = (
             self.key.endpoint.clone(),
             self.key.commitment,
             self.key.token_env.clone(),
         );
-        let Some(group) = state.groups.get_mut(&group_key) else {
+        let Some(group) = groups.get_mut(&group_key) else {
             return;
         };
         let freed = match group.placement.get_mut(&self.address) {
@@ -292,12 +305,14 @@ impl Drop for DetachGuard {
             if freed {
                 slot.addresses = slot.addresses.saturating_sub(1);
             }
-            if slot.attaches == 0 {
-                *entry = None;
+            if slot.attaches == 0
+                && let Some(dropped) = entry.take()
+            {
+                gates.insert(self.key.clone(), dropped.gate);
             }
         }
         if group.shards.iter().all(Option::is_none) {
-            state.groups.remove(&group_key);
+            groups.remove(&group_key);
         }
     }
 }

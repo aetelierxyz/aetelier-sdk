@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -22,8 +22,8 @@ use crate::framework::model::DomainEvent;
 use crate::framework::onchain::{DecodedTransaction, RowContext, WatchedAddress};
 use crate::framework::registry::TaskExit;
 use crate::framework::slotbook::{
-    COVERAGE_MARGIN_SLOTS, CoverageStart, DEFAULT_REORDER_WINDOW_SLOTS, ReleasedBank,
-    SlotBookConfig, SlotGap, SlotPosition,
+    CoverageStart, DEFAULT_REORDER_WINDOW_SLOTS, ReleasedBank, SlotBookConfig, SlotGap,
+    SlotPosition,
 };
 use crate::workers::market_worker::framework_reconnect_policy;
 
@@ -57,7 +57,7 @@ pub(crate) struct ConnectionContext {
 enum Coverage {
     None,
     Connection,
-    FromSlot(u64),
+    ParentAfter(u64),
 }
 
 enum Offer {
@@ -83,11 +83,11 @@ struct AttachState {
 }
 
 impl AttachState {
-    fn covers(&self, slot: u64) -> bool {
+    fn covers(&self, bank: &ReleasedBank<DecodedTransaction>) -> bool {
         match self.coverage {
             Coverage::None => false,
             Coverage::Connection => true,
-            Coverage::FromSlot(from) => slot >= from,
+            Coverage::ParentAfter(slot) => bank.parent_slot > slot,
         }
     }
 
@@ -277,7 +277,7 @@ impl ConnectionCore {
         {
             let coverage = match self.assembler.book().highest_slot() {
                 0 => Coverage::Connection,
-                highest => Coverage::FromSlot(highest + COVERAGE_MARGIN_SLOTS),
+                highest => Coverage::ParentAfter(highest),
             };
             (update.attaching, coverage)
         } else {
@@ -429,7 +429,7 @@ impl ConnectionCore {
         for bank in &banks {
             let position = bank.position();
             for (id, attach) in &mut self.attaches {
-                if attach.gone || !attach.covers(bank.slot) {
+                if attach.gone || !attach.covers(bank) {
                     continue;
                 }
                 let gap = attach
@@ -516,6 +516,44 @@ impl ConnectLimiter {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ReconnectGate {
+    held: Mutex<Option<HeldGate>>,
+}
+
+struct HeldGate {
+    until: Instant,
+    attempts: VecDeque<Instant>,
+}
+
+impl ReconnectGate {
+    pub(crate) fn holds(&self, now: Instant) -> bool {
+        self.held().as_ref().is_some_and(|held| held.until > now)
+    }
+
+    fn hold(&self, until: Instant, limiter: &ConnectLimiter) {
+        *self.held() = Some(HeldGate {
+            until,
+            attempts: limiter.attempts.clone(),
+        });
+    }
+
+    fn resume(&self, window: RateWindow, now: Instant) -> (Instant, ConnectLimiter) {
+        let mut limiter = ConnectLimiter::new(window);
+        match self.held().as_ref().filter(|held| held.until > now) {
+            Some(held) => {
+                limiter.attempts.clone_from(&held.attempts);
+                (held.until, limiter)
+            }
+            None => (now, limiter),
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, Option<HeldGate>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 pub(crate) fn next_attempt_at(
     now: Instant,
     action: ReconnectAction,
@@ -541,6 +579,7 @@ impl SharedGrpcConnection {
         key: ConnectionKey,
         context: ConnectionContext,
         dial: Arc<dyn GeyserDial>,
+        gate: Arc<ReconnectGate>,
         first: NewAttach,
     ) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
@@ -550,7 +589,7 @@ impl SharedGrpcConnection {
             SourceMetrics::default(),
         );
         core.add(first);
-        tokio::spawn(run(key, context, dial, core, receiver));
+        tokio::spawn(run(key, context, dial, gate, core, receiver));
         Self { commands }
     }
 
@@ -567,11 +606,12 @@ async fn run(
     key: ConnectionKey,
     context: ConnectionContext,
     dial: Arc<dyn GeyserDial>,
+    gate: Arc<ReconnectGate>,
     mut core: ConnectionCore,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
     let mut policy = framework_reconnect_policy(context.reconnect.as_ref());
-    let mut limiter = ConnectLimiter::new(context.connect_rate);
+    let (mut next_at, mut limiter) = gate.resume(context.connect_rate, Instant::now());
     let settings = GrpcSettings::new(&context.section, context.x_token.clone());
     let endpoint = settings.endpoint_host();
     let link = Link {
@@ -581,7 +621,6 @@ async fn run(
         dial: dial.as_ref(),
         tip: commitment_level(context.section.commitment),
     };
-    let mut next_at = Instant::now();
     while wait_for_attempt(next_at, &mut core, &mut commands).await {
         limiter.record(Instant::now());
         let mut server = ServerVersion::default();
@@ -618,6 +657,7 @@ async fn run(
             }
         };
         next_at = next_attempt_at(now, action, cool_down, &mut limiter);
+        gate.hold(next_at, &limiter);
         warn!(
             endpoint = %endpoint,
             shard = key.shard,
@@ -1082,6 +1122,41 @@ mod tests {
             ]
         );
         assert_eq!(c.batches(), vec![vec!["row 105:0", "tick 105"]]);
+    }
+
+    #[test]
+    fn a_live_attach_is_covered_from_the_second_bank_after_its_acknowledgement() {
+        let mut core = core();
+        let mut a = join(&mut core, 1, 1, 8);
+        covered(&mut core);
+        bank(&mut core, 102, &[(0, &[1])]);
+        a.batches();
+        let mut c = join(&mut core, 2, 3, 8);
+        core.next_update().expect("the attach joins by update");
+        core.update_sent(2);
+        core.on_acknowledged(2, true);
+        for (slot, parent_slot, height) in
+            [(104, 102, 53), (108, 104, 54), (109, 108, 55)]
+        {
+            core.on_update(tx(slot, 0, &[1, 3]));
+            core.on_update(GrpcUpdate::BlockMeta(BlockMeta {
+                parent_slot,
+                block_height: Some(height),
+                ..block(slot)
+            }));
+        }
+        assert_eq!(
+            a.batches(),
+            vec![
+                vec!["row 104:0", "tick 104"],
+                vec!["row 108:0", "tick 108"],
+                vec!["row 109:0", "tick 109"],
+            ]
+        );
+        assert_eq!(
+            c.batches(),
+            vec![vec!["row 108:0", "tick 108"], vec!["row 109:0", "tick 109"]]
+        );
     }
 
     #[test]
@@ -1598,8 +1673,13 @@ mod tests {
         let dial: Arc<dyn GeyserDial> = stalled.clone();
         let (first, mut probe) = new_attach(1, 1, 8);
         let started = Instant::now();
-        let connection =
-            SharedGrpcConnection::spawn(task_key(), task_context(), dial, first);
+        let connection = SharedGrpcConnection::spawn(
+            task_key(),
+            task_context(),
+            dial,
+            Arc::default(),
+            first,
+        );
         let reason = next_loss(&mut probe, Duration::from_secs(20)).await;
         assert_eq!(started.elapsed(), OPEN_TIMEOUT);
         assert!(reason.contains("open timed out after 15s"), "{reason}");
@@ -1627,8 +1707,13 @@ mod tests {
         let dial: Arc<dyn GeyserDial> = stalled.clone();
         let (first, mut leaving) = new_attach(1, 1, 8);
         let started = Instant::now();
-        let connection =
-            SharedGrpcConnection::spawn(task_key(), task_context(), dial, first);
+        let connection = SharedGrpcConnection::spawn(
+            task_key(),
+            task_context(),
+            dial,
+            Arc::default(),
+            first,
+        );
         next_loss(&mut leaving, Duration::from_secs(20)).await;
         assert_eq!(started.elapsed(), OPEN_TIMEOUT);
         let (second, mut joining) = new_attach(2, 2, 8);
@@ -1687,8 +1772,13 @@ mod tests {
             let dial: Arc<dyn GeyserDial> = terminal.clone();
             let (first, _first) = new_attach(1, 1, 8);
             let (late, probe) = new_attach(2, 2, 8);
-            let connection =
-                SharedGrpcConnection::spawn(task_key(), task_context(), dial, first);
+            let connection = SharedGrpcConnection::spawn(
+                task_key(),
+                task_context(),
+                dial,
+                Arc::default(),
+                first,
+            );
             while !terminal.dialing.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }

@@ -281,6 +281,41 @@ async fn resource_exhausted_waits_out_a_ten_second_cooldown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_cool_down_outlives_the_last_detach_and_holds_the_next_connection() {
+    let mock = MockGeyser::default();
+    let (pool, dial) = duplex_pool(&mock);
+    let chain = Chain::recent();
+    let mut a = attach(&pool);
+    let connection = delivering(&mock, &chain, &mut a).await;
+    connection.fail(Status::resource_exhausted(
+        "too many streams for this token",
+    ));
+    let failed_at = Instant::now();
+    let lost = next_batch(&mut a).await;
+    assert!(lost_reason(&lost).contains("ResourceExhausted"), "{lost:?}");
+    drop(a);
+    assert!(pool.connections().is_empty());
+    sleep(Duration::from_secs(4)).await;
+    let mut b = attach(&pool);
+    let reconnected = subscribed(&mock).await;
+    let dials = dial.dials();
+    assert_eq!(dials.len(), 2);
+    assert_eq!(dials[1] - failed_at, Duration::from_secs(10));
+    reconnected.send_all([chain.meta(110), chain.meta(111)]);
+    reconnected.send_all(chain.bank(112, &[(0, &[address(1)])]));
+    assert_eq!(
+        kinds(&next_batch(&mut b).await),
+        vec!["row 112:0", "tick 112"]
+    );
+    drop(b);
+    let reattached_at = Instant::now();
+    let _c = attach(&pool);
+    let _again = subscribed(&mock).await;
+    assert_eq!(dial.dials().len(), 3);
+    assert_eq!(dial.dials()[2], reattached_at);
+}
+
+#[tokio::test(start_paused = true)]
 async fn unavailable_from_http_429_waits_out_the_cooldown_and_retry_after_extends_it() {
     let mut retry_after = Status::unavailable(HTTP_429);
     retry_after
@@ -479,6 +514,42 @@ async fn reconnect_attempts_are_paced_to_ten_per_minute() {
     assert_eq!(dials[10] - dials[0], Duration::from_secs(60));
     for window in dials.windows(11) {
         assert!(window[10] - window[0] >= Duration::from_secs(60));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_connection_opened_during_a_held_wait_keeps_the_earlier_connect_attempts() {
+    let mock = MockGeyser::default();
+    let (pool, dial) = duplex_pool(&mock);
+    dial.refuse_next(4);
+    let paced = |initial_delay_ms| AttachSpec {
+        reconnect: Some(ReconnectSection {
+            initial_delay_ms: Some(initial_delay_ms),
+            max_delay_ms: Some(30_000),
+            max_attempts: None,
+            jitter_factor: Some(0.0),
+        }),
+        connect_rate: RateWindow {
+            max: 2,
+            per: Duration::from_secs(60),
+        },
+        ..spec(section(), watching(1), SourceMetrics::default(), 64)
+    };
+    let mut a = pool.attach(paced(2_500)).expect("the attach is admitted");
+    for _ in 0..2 {
+        lost_reason(&within(&mut a, 10).await);
+    }
+    drop(a);
+    let mut b = pool.attach(paced(1)).expect("the attach is admitted");
+    let _connection = subscribed(&mock).await;
+    let dials = dial.dials();
+    let offsets: Vec<Duration> = dials.iter().map(|at| *at - dials[0]).collect();
+    assert_eq!(
+        offsets,
+        [0, 5, 60, 65, 120].map(Duration::from_secs).to_vec()
+    );
+    for kind in ["lost", "lost", "resumed"] {
+        assert_eq!(kinds(&within(&mut b, 1).await), vec![kind]);
     }
 }
 

@@ -37,6 +37,8 @@ use aetelier_connect::workers::market_worker::MarketWorker;
 #[cfg(feature = "parquet")]
 use aetelier_io::ParquetSnapshotFlusher;
 
+const UNSET_RUST_LOG_FILTER: &str = "info,rustls=off";
+
 /// Synchronised market data collection worker.
 #[derive(Parser, Debug)]
 #[command(name = "md_worker", version, about)]
@@ -50,9 +52,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     // ── Tracing ─────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(log_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok()))
         .with_target(true)
         .with_thread_ids(false)
         .init();
@@ -183,4 +183,48 @@ fn build_worker(cfg: MarketWorkerConfig) -> anyhow::Result<MarketWorker> {
 #[cfg(not(feature = "parquet"))]
 fn build_worker(cfg: MarketWorkerConfig) -> anyhow::Result<MarketWorker> {
     MarketWorker::from_config(cfg)
+}
+
+fn log_filter(rust_log: Option<String>) -> EnvFilter {
+    rust_log
+        .and_then(|directives| EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| EnvFilter::new(UNSET_RUST_LOG_FILTER))
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+
+    use super::*;
+
+    fn admits(rust_log: Option<&str>) -> [bool; 4] {
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(log_filter(rust_log.map(str::to_string)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            [
+                tracing::enabled!(target: "aetelier_connect::workers", Level::INFO),
+                tracing::enabled!(target: "md_worker", Level::INFO),
+                tracing::enabled!(target: "rustls::common_state", Level::WARN),
+                tracing::enabled!(target: "rustls::client::hs", Level::DEBUG),
+            ]
+        })
+    }
+
+    #[test]
+    fn an_unset_or_unparseable_rust_log_logs_info_without_rustls() {
+        assert_eq!(admits(None), [true, true, false, false]);
+        assert_eq!(admits(Some("info,rustls=loud")), [true, true, false, false]);
+    }
+
+    #[test]
+    fn an_explicit_rust_log_keeps_full_control_over_rustls() {
+        assert_eq!(admits(Some("info")), [true, true, true, false]);
+        assert_eq!(admits(Some("debug")), [true, true, true, true]);
+        assert_eq!(admits(Some("info,rustls=off")), [true, true, false, false]);
+        assert_eq!(
+            admits(Some("aetelier_connect=info,md_worker=info")),
+            [true, true, false, false]
+        );
+    }
 }

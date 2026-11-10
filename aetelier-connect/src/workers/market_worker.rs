@@ -1166,7 +1166,7 @@ impl MarketWorker {
                 vec![symbol.clone()],
                 declared_set.clone(),
                 dev_tx,
-                adapter_shutdown,
+                adapter_shutdown.clone(),
                 metrics.clone(),
             );
             let runtime = SourceRuntime::new(
@@ -1187,7 +1187,7 @@ impl MarketWorker {
                 dev_rx,
                 seeder.clone(),
                 recon_tx,
-                shutdown.clone(),
+                adapter_shutdown,
             ));
             if !matches!(
                 connection_state,
@@ -1201,12 +1201,25 @@ impl MarketWorker {
             // breaker reset on recovery rather than accumulating for the
             // worker's whole lifetime.
             let mut connection_live = false;
+            let mut bank_open = false;
+            let mut finish_bank_by: Option<tokio::time::Instant> = None;
 
             loop {
                 tokio::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() { stopped = true; break; }
+                    _ = shutdown.changed(), if finish_bank_by.is_none() => {
+                        if *shutdown.borrow() {
+                            stopped = true;
+                            finish_bank_by = open_bank_deadline(transport, bank_open, paused);
+                            if finish_bank_by.is_none() { break; }
+                        }
                     }
+
+                    () = async {
+                        match finish_bank_by {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => break,
 
                     _ = timer.tick(), if external_clock => {
                         if !paused {
@@ -1434,9 +1447,11 @@ impl MarketWorker {
                                     sync.on_trade(trade);
                                 }
                                 ReconstructedEvent::Transaction(tx) => {
+                                    bank_open = true;
                                     sync.on_transaction(*tx);
                                 }
                                 ReconstructedEvent::SlotTick(tick) => {
+                                    bank_open = false;
                                     if tick.block_time_us > 0 {
                                         let now_us = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -1461,6 +1476,7 @@ impl MarketWorker {
                                 snapshots_since_flush += n;
                                 maybe_flush(&sinks, flush_threshold, &mut snapshots_since_flush, &mut flushes)?;
                             }
+                            if finish_bank_by.is_some() && !bank_open { break; }
                         }
                         None => break, // runtime ended — leave the inner loop
                     },
@@ -1503,7 +1519,7 @@ impl MarketWorker {
                         }
                     }
 
-                    cmd = recv_cmd(&mut cmd_rx) => match cmd {
+                    cmd = recv_cmd(&mut cmd_rx), if finish_bank_by.is_none() => match cmd {
                         Some(WorkerCommand::Pause) => {
                             paused = true;
                             connection_state = crate::ConnectionState::Paused;
@@ -1514,7 +1530,8 @@ impl MarketWorker {
                         }
                         Some(WorkerCommand::Stop) | Some(WorkerCommand::Restart) => {
                             stopped = true;
-                            break;
+                            finish_bank_by = open_bank_deadline(transport, bank_open, paused);
+                            if finish_bank_by.is_none() { break; }
                         }
                         None => {}
                     },
@@ -1572,6 +1589,7 @@ impl MarketWorker {
             if transport == TransportKind::Grpc {
                 (connection_state, drain_partial) =
                     stream_attach_ended(&adapter_exit, &feeds, connection_state);
+                drain_partial |= bank_open;
                 if let TaskExit::Failed(reason) = &adapter_exit {
                     tracing::error!(
                         exchange = exchange_name.as_str(),
@@ -1852,6 +1870,20 @@ fn stream_attach_ended(
         TaskExit::DrainTimedOut => (state, true),
         TaskExit::Completed | TaskExit::Exhausted => (state, false),
     }
+}
+
+fn open_bank_deadline(
+    transport: crate::config::workers::market_worker_config::TransportKind,
+    bank_open: bool,
+    paused: bool,
+) -> Option<tokio::time::Instant> {
+    let finishes = transport
+        == crate::config::workers::market_worker_config::TransportKind::Grpc
+        && bank_open
+        && !paused;
+    finishes.then(|| {
+        tokio::time::Instant::now() + crate::framework::driver::STOP_DRAIN_TIMEOUT
+    })
 }
 
 /// Receive the next command, or pend forever when no receiver is attached.
