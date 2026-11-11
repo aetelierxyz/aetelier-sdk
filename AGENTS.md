@@ -24,6 +24,8 @@ Declared in `aetelier-sdk/Cargo.toml`. Release binaries are built by
 | `rehydrate` | `aetelier-sdk` | `parquet` | `--features parquet,grpc` |
 | `entrepot` | `aetelier-sdk` | default | not released |
 
+`md_worker` exits `0` after a stop or shutdown, `1` on a startup error, and `78` when every worker ended `Rejected` after a terminal gRPC rejection; a supervisor must not restart it after `78`.
+
 `grpc` compiles in the `solana` venue (`market_type = "onchain"`,
 `transport = "grpc"`). `aetelier-sdk/serve/md_worker.Dockerfile` builds
 `md_worker` with `--features parquet,grpc` as well. An `md_worker` built

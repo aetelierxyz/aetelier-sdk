@@ -6,7 +6,7 @@
 //! from `aetelier-connect`, allowing workers to persist snapshots to Parquet
 //! files without `aetelier-connect` depending on `arrow`/`parquet` directly.
 
-use aetelier_connect::workers::{FlushReport, SnapshotFlusher};
+use aetelier_connect::workers::{FlushReport, SlotWindow, SnapshotFlusher};
 use aetelier_types::errors::PersistError;
 use aetelier_types::snapshots::MarketSnapshot;
 
@@ -45,18 +45,18 @@ fn file_bytes(path: &std::path::Path) -> Result<u64, PersistError> {
 /// platform-composed dir carries the LITERAL `{data_type}` placeholder
 /// (`datasets/recorded/<exchange>/<market_type>/{data_type}/<binding_id>`):
 /// the placeholder is substituted and a UTC day segment derived from the
-/// batch's `t_min_us` is appended, so leaves are day-bounded with one index
+/// batch's `t_min_us` (a heartbeat's `t_max_us`) is appended, one index
 /// per day-dir. A dir without the placeholder keeps the legacy
 /// `<dir>/<data_type>/` shape (dev and BYO continuity).
 fn leaf_dir_for(
     output_path: &std::path::Path,
     datatype: &str,
-    t_min_us: u64,
+    day_ts_us: u64,
 ) -> std::path::PathBuf {
     let raw = output_path.to_string_lossy();
     if raw.contains("{data_type}") {
         let substituted = raw.replace("{data_type}", datatype);
-        let day = chrono::DateTime::from_timestamp_micros(t_min_us as i64)
+        let day = chrono::DateTime::from_timestamp_micros(day_ts_us as i64)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "1970-01-01".to_string());
         std::path::PathBuf::from(substituted).join(day)
@@ -117,6 +117,41 @@ where
     Ok(bytes)
 }
 
+fn grid_bounds(snapshots: &[MarketSnapshot]) -> (u64, u64) {
+    snapshots.iter().fold((u64::MAX, 0u64), |(lo, hi), s| {
+        (lo.min(s.ts_us), hi.max(s.ts_us))
+    })
+}
+
+fn persist_heartbeat(
+    output_path: &std::path::Path,
+    window: &SlotWindow,
+    t_min_us: u64,
+    t_max_us: u64,
+) -> Result<(), PersistError> {
+    let datatype = crate::onchain::DATATYPE_DIR;
+    let leaf = leaf_dir_for(output_path, datatype, t_max_us);
+    std::fs::create_dir_all(&leaf)?;
+    let guard = crate::leaf_index::leaf_write_guard(&leaf);
+    let _serialized = guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::leaf_index::acquire_leaf_lock(&leaf)?;
+    crate::leaf_index::append_heartbeat(
+        &leaf,
+        &crate::leaf_index::HeartbeatEntry {
+            heartbeat: true,
+            symbol: window.symbol.clone(),
+            rows: 0,
+            t_min_us,
+            t_max_us,
+            last_slot: window.last_tick.map(|tick| tick.slot),
+            last_block_height: window.last_tick.map(|tick| tick.block_height),
+            schema_id: format!("{datatype}.v1"),
+        },
+    )
+}
+
 impl SnapshotFlusher for ParquetSnapshotFlusher {
     fn flush_snapshots(
         &self,
@@ -127,10 +162,7 @@ impl SnapshotFlusher for ParquetSnapshotFlusher {
             return Ok(FlushReport::default());
         }
 
-        let (t_min_us, t_max_us) =
-            snapshots.iter().fold((u64::MAX, 0u64), |(lo, hi), s| {
-                (lo.min(s.ts_us), hi.max(s.ts_us))
-            });
+        let (t_min_us, t_max_us) = grid_bounds(snapshots);
 
         let crate::snapshots::DecomposedSnapshots {
             orderbooks,
@@ -267,5 +299,28 @@ impl SnapshotFlusher for ParquetSnapshotFlusher {
         }
 
         Ok(FlushReport::new(total_bytes, total_files))
+    }
+
+    fn flush_slot_window(
+        &self,
+        snapshots: &[MarketSnapshot],
+        output_dir: &str,
+        window: &SlotWindow,
+    ) -> Result<FlushReport, PersistError> {
+        let report = self.flush_snapshots(snapshots, output_dir)?;
+        if !snapshots.is_empty()
+            && snapshots
+                .iter()
+                .all(|snapshot| snapshot.transactions.is_empty())
+        {
+            let (t_min_us, t_max_us) = grid_bounds(snapshots);
+            persist_heartbeat(
+                std::path::Path::new(output_dir),
+                window,
+                t_min_us,
+                t_max_us,
+            )?;
+        }
+        Ok(report)
     }
 }

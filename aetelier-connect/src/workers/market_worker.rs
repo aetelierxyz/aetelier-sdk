@@ -106,6 +106,7 @@ pub struct MarketWorkerReport {
     pub snapshots_produced: u64,
     /// Number of flush cycles completed.
     pub flushes: u32,
+    pub feeds: Vec<crate::framework::feed::FeedSnapshot>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -767,6 +768,7 @@ impl MarketWorker {
             ingestion,
             snapshots_produced,
             flushes,
+            feeds: Vec::new(),
         })
     }
 
@@ -950,6 +952,7 @@ impl MarketWorker {
             &exchange_name,
             &symbol,
         )?;
+        let slot_symbol = instrument.canonical();
         let model = adapter.book_model("orders");
         // The adapter is the single source of truth for the seeding
         // taxonomy: SnapshotSource drives needs_rest and the recovery
@@ -1464,6 +1467,7 @@ impl MarketWorker {
                                             0.2 * sample + 0.8 * latency_us_ewma
                                         };
                                     }
+                                    let _ = sinks.emit_slot_tick(&slot_symbol, tick);
                                     sync.on_slot_tick(tick.block_time_us);
                                 }
                                 ReconstructedEvent::SlotGap(_)
@@ -1802,6 +1806,7 @@ impl MarketWorker {
             ingestion,
             snapshots_produced,
             flushes,
+            feeds: feeds.lock().map(|f| f.snapshot()).unwrap_or_default(),
         })
     }
 }

@@ -47,7 +47,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
-use aetelier_io::leaf_index::{INDEX_FILE, pending_files, read_index};
+use aetelier_io::leaf_index::{INDEX_FILE, pending_files, read_index, read_leaf_index};
 use aetelier_io::naming::{FileKind, FileName, parse_file_name};
 use aetelier_io::onchain::{
     LeafKeys, check_transactions, read_transaction_keys, read_transactions_parquet,
@@ -239,6 +239,7 @@ struct LeafListing {
     files: Vec<PathBuf>,
     pending: Vec<String>,
     torn_index_lines: usize,
+    heartbeats: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -290,6 +291,8 @@ struct RunSummary {
     pending_files: u64,
     #[serde(default)]
     torn_index_lines: u64,
+    #[serde(default)]
+    heartbeats: u64,
     bytes_seen: u64,
     total_orderbook_snapshots: u64,
     total_trades: u64,
@@ -400,7 +403,7 @@ fn run(cli: &Cli, state: &mut State, started_at_unix_ms: u64) -> Result<RunOutpu
             let count: usize = listings
                 .iter()
                 .filter(|(leaf, _)| &leaf.exchange == ex && leaf.kind == kind)
-                .map(|(_, listing)| listing.files.len())
+                .map(|(_, listing)| listing.files.len() + listing.heartbeats)
                 .sum();
             if count == 0 {
                 t01_failures.push(format!(
@@ -416,6 +419,7 @@ fn run(cli: &Cli, state: &mut State, started_at_unix_ms: u64) -> Result<RunOutpu
     let mut file_reports: Vec<FileReport> = Vec::new();
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut torn_index_lines = 0u64;
+    let mut heartbeats = 0u64;
     let mut t11_leaf_failures: Vec<String> = Vec::new();
     let mut new_files = 0u64;
     let mut bytes_seen = 0u64;
@@ -428,6 +432,7 @@ fn run(cli: &Cli, state: &mut State, started_at_unix_ms: u64) -> Result<RunOutpu
 
     for (leaf, listing) in &listings {
         torn_index_lines += listing.torn_index_lines as u64;
+        heartbeats += listing.heartbeats as u64;
         pending.extend(listing.pending.iter().map(|filename| PendingFile {
             leaf: leaf.dir.to_string_lossy().into_owned(),
             filename: filename.clone(),
@@ -578,6 +583,7 @@ fn run(cli: &Cli, state: &mut State, started_at_unix_ms: u64) -> Result<RunOutpu
         new_files,
         pending_files: pending.len() as u64,
         torn_index_lines,
+        heartbeats,
         bytes_seen,
         total_orderbook_snapshots: total_ob_snapshots,
         total_trades,
@@ -982,6 +988,7 @@ fn print_report(
         println!("│         · … and {} more", pending.len() - 5);
     }
     println!("│ torn_index_lines  : {}", summary.torn_index_lines);
+    println!("│ heartbeats        : {}", summary.heartbeats);
     println!("│ bytes_seen        : {}", human_bytes(summary.bytes_seen));
     println!(
         "│ ob_snapshots      : {}",
@@ -1190,14 +1197,15 @@ fn list_leaf(leaf: &Leaf) -> Result<LeafListing> {
             ..LeafListing::default()
         });
     }
-    let (entries, torn_index_lines) = read_index(&leaf.dir)?;
-    let mut names: Vec<String> = entries.into_iter().map(|e| e.filename).collect();
+    let index = read_leaf_index(&leaf.dir)?;
+    let mut names: Vec<String> = index.entries.into_iter().map(|e| e.filename).collect();
     names.sort();
     names.dedup();
     Ok(LeafListing {
         files: names.iter().map(|name| leaf.dir.join(name)).collect(),
         pending: pending_files(&leaf.dir)?,
-        torn_index_lines,
+        torn_index_lines: index.torn,
+        heartbeats: index.heartbeats.len(),
     })
 }
 
@@ -1772,6 +1780,7 @@ mod tests {
                 files: vec![first, second],
                 pending: Vec::new(),
                 torn_index_lines: 1,
+                heartbeats: 0,
             }
         );
 
@@ -2024,5 +2033,90 @@ mod tests {
                 mixed.display()
             )]
         );
+    }
+
+    fn heartbeat(leaf: &Path, t_min_us: u64, t_max_us: u64) {
+        aetelier_io::leaf_index::append_heartbeat(
+            leaf,
+            &aetelier_io::leaf_index::HeartbeatEntry {
+                heartbeat: true,
+                symbol: JUPITER_V6.to_string(),
+                rows: 0,
+                t_min_us,
+                t_max_us,
+                last_slot: Some(380_000_000),
+                last_block_height: Some(358_000_000),
+                schema_id: "transactions.v1".to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_leaf_with_only_heartbeats_passes_and_counts_them() {
+        let data = tempfile::tempdir().unwrap();
+        let leaf = leaf_dir(data.path(), TX_LEAF);
+        heartbeat(&leaf, BOOKS_START_US, BOOKS_START_US + 59_000_000);
+        heartbeat(
+            &leaf,
+            BOOKS_START_US + 60_000_000,
+            BOOKS_START_US + 119_000_000,
+        );
+
+        let run = validate_txs(data.path(), &[], &mut State::default());
+
+        let failed: Vec<&str> = run
+            .tests
+            .iter()
+            .filter(|t| !t.passed)
+            .map(|t| t.code)
+            .collect();
+        assert_eq!(failed, Vec::<&str>::new());
+        assert_eq!(
+            (
+                run.summary.files_seen,
+                run.summary.pending_files,
+                run.summary.torn_index_lines,
+                run.summary.heartbeats,
+            ),
+            (0, 0, 0, 2)
+        );
+        assert_eq!(report_json(&run)["summary"]["heartbeats"], 2);
+    }
+
+    #[test]
+    fn heartbeats_beside_files_skip_the_file_checks_and_t10() {
+        let data = tempfile::tempdir().unwrap();
+        let leaf = leaf_dir(data.path(), TX_LEAF);
+        let file = tx_file(&leaf, &transactions(JUPITER_V6, &[(380_000_000, 1, "a")]));
+        heartbeat(&leaf, 0, u64::MAX);
+        index(&file, 1);
+        heartbeat(&leaf, 0, u64::MAX);
+
+        let run = validate_txs(data.path(), &[], &mut State::default());
+
+        assert!(run.tests.iter().all(|t| t.passed));
+        assert_eq!(run.files.len(), 1);
+        assert_eq!(run.files[0].path, file.to_string_lossy());
+        assert_eq!(
+            (
+                run.summary.pending_files,
+                run.summary.torn_index_lines,
+                run.summary.heartbeats
+            ),
+            (0, 0, 2)
+        );
+    }
+
+    #[test]
+    fn cex_leaves_report_no_heartbeats() {
+        let data = tempfile::tempdir().unwrap();
+        let leaf = leaf_dir(data.path(), BOOK_LEAF);
+        index(&book_file(&leaf, BOOKS_START_US), 300);
+
+        let run = validate_books(data.path(), &mut State::default());
+
+        assert_eq!(run.summary.heartbeats, 0);
+        assert_eq!(report_json(&run)["summary"]["heartbeats"], 0);
     }
 }

@@ -41,6 +41,8 @@ entry is edited only to correct a factual error, never to restate its scope.
 - Solana captures in `aetelier-connect/datasets/solana/`: eight whole-slot windows of raw `SubscribeUpdate` bytes from publicnode, covering finalized and confirmed, filtered and unfiltered, a quiet address and a resubscribe at tip, with provenance in `datasets/README.md`.
 - The `solana` conformance suite under feature `grpc`, on those captures (`done: true`): kinds `tx_decode_surface`, `slot_assembly`, `slot_reorder`, `tx_dedup`, `slot_gap_detection`, `slot_tick_grid`, `shared_connection_fanout`, `address_match_roles`, `failed_inclusion` and `tx_invariants`, not applicable on the 13 CEX venues.
 - Atlas ids `DAT-TX-INV-1` to `DAT-TX-INV-4`, `DAT-SB-INV-1`, `DAT-SB-INV-2`, `DAT-SB-T-1`, `DAT-SB-T-2` and `DAT-SY-INV-25` in `framework::atlas::ENFORCED` under feature `grpc`.
+- `index.jsonl` heartbeat lines on `transactions` leaves: a flush window with no transaction rows appends `{"heartbeat":true,"symbol","rows":0,"t_min_us","t_max_us","last_slot","last_block_height","schema_id":"transactions.v1"}` to the leaf of the UTC day of `t_max_us`, creating the leaf when absent; `last_slot` and `last_block_height` come from the newest `SlotTick` at or before `t_max_us`, `null` when none was seen. CEX leaves never get one.
+- `aetelier_io::leaf_index`: `HeartbeatEntry`, `LeafIndex`, `read_leaf_index` and `append_heartbeat`; `OutputSink::emit_slot_tick`, `OutputSinkSet::emit_slot_tick`, `SnapshotFlusher::flush_slot_window`, `SlotWindow` and `MarketWorkerReport.feeds`.
 
 ### Changed
 
@@ -59,6 +61,8 @@ entry is edited only to correct a factual error, never to restate its scope.
 - `md_worker` with `RUST_LOG` unset logs at `info` with the `rustls` targets off; an explicit `RUST_LOG` is used as given.
 - The release workflow runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in its gates and builds the released `md_worker`, `validate` and `rehydrate` binaries with `--features parquet,grpc`; `md_worker.Dockerfile` builds `md_worker` with `--features parquet,grpc`.
 - `VenueConformance` gains `expect_instrument` and `stream_fixtures`, with a loader for `{"t_us","upd"}` and `{"t_us","reconnect":true}` lines; `symbol_canonicalization` checks `decode_instrument`, `feed_lifecycle` replays stream venues through `replay_stream`, and `datatype_isolation` is not applicable on single-datatype venues.
+- A line with `"heartbeat": true` in `index.jsonl` is a heartbeat, never a file and never torn; `read_index` and `pending_files` skip it. `validate` reports `heartbeats`, counts them toward T01 and skips them in T10 and the file checks.
+- `md_worker` exits `78` when every worker ended `Rejected` after a terminal gRPC rejection, logging each reason first; a stop or shutdown still exits `0` and a startup error `1`.
 
 ### Fixed
 

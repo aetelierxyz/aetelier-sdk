@@ -3,11 +3,11 @@
 //! A leaf is one datatype directory of the sink layout (`<output_dir>/trades`,
 //! `<output_dir>/orderbooks`, …). Each leaf carries:
 //!
-//! - `index.jsonl` — one appended JSON line per finalized parquet file:
-//!   `{filename, sha256, rows, t_min_us, t_max_us, schema_id}`. Append-only,
-//!   `O_APPEND` + fsync per line; the file is never rewritten, so a torn run
-//!   loses at most the in-flight line (the gap-ledger durability model,
-//!   DAT-SK-INV-20).
+//! - `index.jsonl` — one appended JSON line per finalized parquet file
+//!   (`{filename, sha256, rows, t_min_us, t_max_us, schema_id}`) or empty slot
+//!   window (`heartbeat`). Append-only, `O_APPEND` + fsync per line; the file
+//!   is never rewritten, so a torn run loses at most the in-flight line (the
+//!   gap-ledger durability model, DAT-SK-INV-20).
 //! - `.staging/` — where a parquet file is written before it is fsynced,
 //!   renamed beside its siblings, and the leaf directory fsynced. A file in
 //!   the leaf is therefore complete or absent; a crash between rename and
@@ -55,6 +55,26 @@ pub struct IndexEntry {
     /// Registry-minted schema id (`<datatype>.v1`); the
     /// registry row for it carries the parquet-schema fingerprint.
     pub schema_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeartbeatEntry {
+    pub heartbeat: bool,
+    pub symbol: String,
+    pub rows: u64,
+    pub t_min_us: u64,
+    pub t_max_us: u64,
+    pub last_slot: Option<u64>,
+    pub last_block_height: Option<u64>,
+    pub schema_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeafIndex {
+    pub entries: Vec<IndexEntry>,
+    pub heartbeats: Vec<HeartbeatEntry>,
+    pub torn: usize,
 }
 
 fn held_locks() -> &'static Mutex<HashMap<PathBuf, File>> {
@@ -159,7 +179,18 @@ pub fn sha256_file(path: &Path) -> Result<String, PersistError> {
 /// Appends one entry to the leaf's `index.jsonl` (`O_APPEND` + fsync). The
 /// leaf lock must already be held by this process.
 pub fn append_entry(leaf: &Path, entry: &IndexEntry) -> Result<(), PersistError> {
-    let mut line = serde_json::to_string(entry)?;
+    append_line(leaf, entry)
+}
+
+pub fn append_heartbeat(
+    leaf: &Path,
+    heartbeat: &HeartbeatEntry,
+) -> Result<(), PersistError> {
+    append_line(leaf, heartbeat)
+}
+
+fn append_line<T: Serialize>(leaf: &Path, value: &T) -> Result<(), PersistError> {
+    let mut line = serde_json::to_string(value)?;
     line.push('\n');
     let mut file = OpenOptions::new()
         .create(true)
@@ -174,24 +205,35 @@ pub fn append_entry(leaf: &Path, entry: &IndexEntry) -> Result<(), PersistError>
 /// (unparseable) lines — at most the in-flight line of a crashed append.
 /// A missing index file is a legacy leaf: `(vec![], 0)`.
 pub fn read_index(leaf: &Path) -> Result<(Vec<IndexEntry>, usize), PersistError> {
+    let index = read_leaf_index(leaf)?;
+    Ok((index.entries, index.torn))
+}
+
+pub fn read_leaf_index(leaf: &Path) -> Result<LeafIndex, PersistError> {
     let file = match File::open(leaf.join(INDEX_FILE)) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], 0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LeafIndex::default());
+        }
         Err(e) => return Err(e.into()),
     };
-    let mut entries = Vec::new();
-    let mut torn = 0usize;
+    let mut index = LeafIndex::default();
     for line in BufReader::new(file).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<IndexEntry>(&line) {
-            Ok(entry) => entries.push(entry),
-            Err(_) => torn += 1,
+        if let Ok(heartbeat) = serde_json::from_str::<HeartbeatEntry>(&line)
+            && heartbeat.heartbeat
+        {
+            index.heartbeats.push(heartbeat);
+        } else if let Ok(entry) = serde_json::from_str::<IndexEntry>(&line) {
+            index.entries.push(entry);
+        } else {
+            index.torn += 1;
         }
     }
-    Ok((entries, torn))
+    Ok(index)
 }
 
 /// Parquet files present in the leaf but absent from its index — the defined

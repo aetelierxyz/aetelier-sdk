@@ -3,7 +3,8 @@
 //! single-writer lock, the defined "pending" crash state, and the staging
 //! orphan sweep.
 
-use aetelier_connect::workers::SnapshotFlusher;
+use aetelier_connect::framework::SlotTick;
+use aetelier_connect::workers::{SlotWindow, SnapshotFlusher};
 use aetelier_io::leaf_index;
 use aetelier_io::sink::ParquetSnapshotFlusher;
 use aetelier_types::TradeSide;
@@ -356,4 +357,292 @@ fn transactions_land_in_their_own_day_bounded_leaf() {
             (380_000_001, 0, "sig-3")
         ]
     );
+}
+
+const JUPITER: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const WINDOW_START_US: u64 = 1_791_321_067_000_000;
+const MIDNIGHT_US: u64 = 1_791_331_200_000_000;
+
+fn quiet_window(start_us: u64, rows: u64) -> Vec<MarketSnapshot> {
+    (0..rows)
+        .map(|row| MarketSnapshot::empty(start_us + row * 1_000_000))
+        .collect()
+}
+
+fn jupiter_window(last_tick: Option<SlotTick>) -> SlotWindow {
+    SlotWindow {
+        symbol: JUPITER.to_string(),
+        last_tick,
+    }
+}
+
+fn utc_day(ts_us: u64) -> String {
+    chrono::DateTime::from_timestamp_micros(ts_us as i64)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn jupiter_transaction(
+    slot: u64,
+    signature: &str,
+    ts_us: u64,
+) -> aetelier_types::onchain::Transaction {
+    use aetelier_types::onchain::{
+        ChainAddress, Commitment, MatchRole, Transaction, TransactionVersion,
+    };
+    Transaction {
+        exchange: "solana".to_string(),
+        address: ChainAddress::solana(JUPITER).unwrap(),
+        match_role: MatchRole::AccountKey,
+        source_tx_ts_us: ts_us,
+        local_tx_ts_us: ts_us + 400_000,
+        source_tx_rtt_us: 0,
+        recv_seq: 0,
+        conn_epoch_us: 1,
+        commitment: Commitment::Finalized,
+        slot,
+        block_height: slot - 22_000_000,
+        blockhash: "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn".to_string(),
+        tx_index: 0,
+        signature: signature.to_string(),
+        version: TransactionVersion::Legacy,
+        success: true,
+        fee_lamports: 5_000,
+        compute_units_consumed: None,
+        compute_unit_limit: None,
+        compute_unit_price_micro_lamports: None,
+        priority_fee_lamports: None,
+        cost_units: None,
+        signers: Vec::new(),
+        account_keys: vec![JUPITER.to_string()],
+        log_messages: None,
+        failure: None,
+    }
+}
+
+#[test]
+fn a_quiet_slot_window_appends_exactly_one_heartbeat_line() {
+    let dir = tempdir().unwrap();
+    let binding = "8d1c2a77-5b8e-4f0e-a1c3-0d9e8f7a6b5c";
+    let template = dir
+        .path()
+        .join("recorded/solana/onchain/{data_type}")
+        .join(binding);
+    let tick = SlotTick {
+        slot: 380_000_123,
+        block_height: 358_000_001,
+        block_time_us: WINDOW_START_US + 2_000_000,
+    };
+
+    let report = ParquetSnapshotFlusher
+        .flush_slot_window(
+            &quiet_window(WINDOW_START_US, 3),
+            template.to_str().unwrap(),
+            &jupiter_window(Some(tick)),
+        )
+        .unwrap();
+
+    assert_eq!((report.files_written, report.bytes_written), (0, 0));
+    let leaf = dir
+        .path()
+        .join("recorded/solana/onchain/transactions")
+        .join(binding)
+        .join(utc_day(WINDOW_START_US));
+    assert_eq!(
+        std::fs::read_to_string(leaf.join(leaf_index::INDEX_FILE)).unwrap(),
+        format!(
+            "{{\"heartbeat\":true,\"symbol\":\"{JUPITER}\",\"rows\":0,\
+             \"t_min_us\":1791321067000000,\"t_max_us\":1791321069000000,\
+             \"last_slot\":380000123,\"last_block_height\":358000001,\
+             \"schema_id\":\"transactions.v1\"}}\n"
+        )
+    );
+    let index = leaf_index::read_leaf_index(&leaf).unwrap();
+    assert_eq!(
+        (index.entries.len(), index.heartbeats.len(), index.torn),
+        (0, 1, 0)
+    );
+    assert!(leaf_index::pending_files(&leaf).unwrap().is_empty());
+    assert!(!leaf.join(leaf_index::STAGING_DIR).exists());
+}
+
+#[test]
+fn a_quiet_window_without_a_slot_tick_writes_null_slots_in_the_flat_leaf() {
+    let dir = tempdir().unwrap();
+
+    ParquetSnapshotFlusher
+        .flush_slot_window(
+            &quiet_window(WINDOW_START_US, 2),
+            dir.path().to_str().unwrap(),
+            &jupiter_window(None),
+        )
+        .unwrap();
+
+    let leaf = dir.path().join("transactions");
+    assert_eq!(
+        leaf_index::read_leaf_index(&leaf).unwrap(),
+        leaf_index::LeafIndex {
+            entries: Vec::new(),
+            heartbeats: vec![leaf_index::HeartbeatEntry {
+                heartbeat: true,
+                symbol: JUPITER.to_string(),
+                rows: 0,
+                t_min_us: WINDOW_START_US,
+                t_max_us: WINDOW_START_US + 1_000_000,
+                last_slot: None,
+                last_block_height: None,
+                schema_id: "transactions.v1".to_string(),
+            }],
+            torn: 0,
+        }
+    );
+    assert!(
+        std::fs::read_to_string(leaf.join(leaf_index::INDEX_FILE))
+            .unwrap()
+            .contains("\"last_slot\":null,\"last_block_height\":null,")
+    );
+}
+
+#[test]
+fn a_quiet_window_across_midnight_lands_in_the_day_of_its_end() {
+    let dir = tempdir().unwrap();
+    let template = dir
+        .path()
+        .join("recorded/solana/onchain/{data_type}/bind-a");
+
+    ParquetSnapshotFlusher
+        .flush_slot_window(
+            &quiet_window(MIDNIGHT_US - 1_000_000, 2),
+            template.to_str().unwrap(),
+            &jupiter_window(None),
+        )
+        .unwrap();
+
+    let binding = dir
+        .path()
+        .join("recorded/solana/onchain/transactions/bind-a");
+    let ending =
+        leaf_index::read_leaf_index(&binding.join(utc_day(MIDNIGHT_US))).unwrap();
+    assert_eq!(ending.heartbeats.len(), 1);
+    assert_eq!(ending.heartbeats[0].t_min_us, MIDNIGHT_US - 1_000_000);
+    assert!(!binding.join(utc_day(MIDNIGHT_US - 1_000_000)).exists());
+}
+
+#[test]
+fn a_slot_window_with_rows_writes_its_file_and_no_heartbeat() {
+    let dir = tempdir().unwrap();
+    let mut snapshots = quiet_window(WINDOW_START_US, 3);
+    snapshots[1].transactions = vec![jupiter_transaction(
+        380_000_000,
+        "sig-1",
+        WINDOW_START_US + 500_000,
+    )];
+
+    let report = ParquetSnapshotFlusher
+        .flush_slot_window(
+            &snapshots,
+            dir.path().to_str().unwrap(),
+            &jupiter_window(None),
+        )
+        .unwrap();
+
+    assert_eq!(report.files_written, 1);
+    let leaf = dir.path().join("transactions");
+    let index = leaf_index::read_leaf_index(&leaf).unwrap();
+    assert_eq!(
+        (index.entries.len(), index.heartbeats.len(), index.torn),
+        (1, 0, 0)
+    );
+    assert_eq!(index.entries[0].rows, 1);
+    assert_eq!(
+        std::fs::read_to_string(leaf.join(leaf_index::INDEX_FILE))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cex_windows_write_their_files_and_never_a_heartbeat() {
+    let dir = tempdir().unwrap();
+    let template = dir.path().join("recorded/kraken/spot/{data_type}/bind-a");
+    for output in [dir.path().to_path_buf(), template] {
+        let output = output.to_str().unwrap();
+        ParquetSnapshotFlusher
+            .flush_snapshots(&[snapshot_with_trade(WINDOW_START_US)], output)
+            .unwrap();
+        let quiet = ParquetSnapshotFlusher
+            .flush_snapshots(&quiet_window(WINDOW_START_US + 1_000_000, 2), output)
+            .unwrap();
+        assert_eq!((quiet.files_written, quiet.bytes_written), (0, 0));
+    }
+
+    for leaf in [
+        dir.path().join("trades"),
+        dir.path()
+            .join("recorded/kraken/spot/trades/bind-a")
+            .join(utc_day(WINDOW_START_US)),
+    ] {
+        let index = leaf_index::read_leaf_index(&leaf).unwrap();
+        assert_eq!(
+            (index.entries.len(), index.heartbeats.len(), index.torn),
+            (1, 0, 0)
+        );
+    }
+    assert!(!dir.path().join("transactions").exists());
+    assert!(
+        !dir.path()
+            .join("recorded/kraken/spot/transactions")
+            .exists()
+    );
+}
+
+#[test]
+fn heartbeat_lines_are_neither_files_nor_torn() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().to_str().unwrap();
+    let mut with_rows = quiet_window(WINDOW_START_US, 1);
+    with_rows[0].transactions =
+        vec![jupiter_transaction(380_000_000, "sig-1", WINDOW_START_US)];
+    ParquetSnapshotFlusher
+        .flush_slot_window(&with_rows, output, &jupiter_window(None))
+        .unwrap();
+    ParquetSnapshotFlusher
+        .flush_slot_window(
+            &quiet_window(WINDOW_START_US + 1_000_000, 1),
+            output,
+            &jupiter_window(None),
+        )
+        .unwrap();
+    let leaf = dir.path().join("transactions");
+    let index_path = leaf.join(leaf_index::INDEX_FILE);
+    let mut lines = std::fs::read_to_string(&index_path).unwrap();
+    lines.push_str(&format!(
+        "{{\"heartbeat\":false,\"symbol\":\"{JUPITER}\",\"rows\":0,\"t_min_us\":0,\
+         \"t_max_us\":0,\"last_slot\":null,\"last_block_height\":null,\
+         \"schema_id\":\"transactions.v1\"}}\n\
+         {{\"heartbeat\":true}}\n\
+         {{\"filename\":\"listed.parquet\",\"sha256\":\"\",\"rows\":1,\"t_min_us\":0,\
+         \"t_max_us\":0,\"schema_id\":\"transactions.v1\",\"heartbeat\":true}}\n\
+         {{\"heartbeat\":true,\"symbol\":\"JUP"
+    ));
+    std::fs::write(&index_path, lines).unwrap();
+
+    let (entries, torn) = leaf_index::read_index(&leaf).unwrap();
+    assert_eq!((entries.len(), torn), (1, 2));
+    let index = leaf_index::read_leaf_index(&leaf).unwrap();
+    assert_eq!(
+        (index.entries.len(), index.heartbeats.len(), index.torn),
+        (1, 3, 2)
+    );
+    assert_eq!(
+        index.heartbeats[1],
+        leaf_index::HeartbeatEntry {
+            heartbeat: true,
+            ..Default::default()
+        }
+    );
+    assert!(leaf_index::pending_files(&leaf).unwrap().is_empty());
 }

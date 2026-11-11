@@ -24,6 +24,7 @@
 //! `session.duration_hours` from the manifest expires.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
@@ -32,12 +33,15 @@ use tracing_subscriber::EnvFilter;
 
 use aetelier_connect::config::workers::market_worker_config::TransportKind;
 use aetelier_connect::config::workers::{MarketWorkerConfig, MarketWorkerManifest};
+use aetelier_connect::framework::FeedState;
+use aetelier_connect::framework::feed::FeedSnapshot;
 use aetelier_connect::workers::market_worker::MarketWorker;
 
 #[cfg(feature = "parquet")]
 use aetelier_io::ParquetSnapshotFlusher;
 
 const UNSET_RUST_LOG_FILTER: &str = "info,rustls=off";
+const EXIT_ALL_REJECTED: u8 = 78;
 
 /// Synchronised market data collection worker.
 #[derive(Parser, Debug)]
@@ -49,7 +53,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     // ── Tracing ─────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok()))
@@ -126,15 +130,16 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        join_set.spawn(async move { worker.run(rx).await });
+        join_set.spawn(async move { (label, grpc, worker.run(rx).await) });
     }
 
     // ── Await all workers ───────────────────────────────────────────────
     let mut total_snapshots: u64 = 0;
+    let mut ends: Vec<(String, Option<String>)> = Vec::new();
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(report)) => {
+            Ok((label, grpc, Ok(report))) => {
                 tracing::info!(
                     exchange = %report.ingestion.exchange,
                     symbol = %report.ingestion.symbol,
@@ -146,12 +151,15 @@ async fn main() -> anyhow::Result<()> {
                     "md_worker.worker_finished"
                 );
                 total_snapshots += report.snapshots_produced;
+                ends.push((label, rejection(grpc, &report.feeds)));
             }
-            Ok(Err(e)) => {
+            Ok((label, _, Err(e))) => {
                 tracing::error!(error = %e, "md_worker.worker_error");
+                ends.push((label, None));
             }
             Err(e) => {
                 tracing::error!(error = %e, "md_worker.worker_panic");
+                ends.push((String::new(), None));
             }
         }
     }
@@ -161,7 +169,46 @@ async fn main() -> anyhow::Result<()> {
         "md_worker.all_workers_finished"
     );
 
-    Ok(())
+    let code = exit_code(&ends);
+    if code == EXIT_ALL_REJECTED {
+        for (label, reason) in &ends {
+            tracing::error!(
+                worker = %label,
+                reason = reason.as_deref().unwrap_or_default(),
+                "md_worker.worker_rejected"
+            );
+        }
+        tracing::error!(
+            workers = ends.len(),
+            exit_code = code,
+            "md_worker.all_workers_rejected"
+        );
+    }
+    Ok(ExitCode::from(code))
+}
+
+fn rejection(grpc: bool, feeds: &[FeedSnapshot]) -> Option<String> {
+    if !grpc
+        || feeds.is_empty()
+        || feeds.iter().any(|feed| feed.state != FeedState::Rejected)
+    {
+        return None;
+    }
+    let mut reasons: Vec<&str> = feeds
+        .iter()
+        .filter_map(|feed| feed.reason.as_deref())
+        .collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    Some(reasons.join("; "))
+}
+
+fn exit_code(ends: &[(String, Option<String>)]) -> u8 {
+    if !ends.is_empty() && ends.iter().all(|(_, rejected)| rejected.is_some()) {
+        EXIT_ALL_REJECTED
+    } else {
+        0
+    }
 }
 
 /// Construct a [`MarketWorker`] with the appropriate sink wiring for the
@@ -226,5 +273,56 @@ mod tests {
             admits(Some("aetelier_connect=info,md_worker=info")),
             [true, true, false, false]
         );
+    }
+
+    fn feed(state: FeedState, reason: Option<&str>) -> FeedSnapshot {
+        FeedSnapshot {
+            id: "feed".to_string(),
+            instrument: "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
+            datatype: aetelier_connect::framework::FeedDatatype::Transactions,
+            state,
+            partial: false,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    fn ended(label: &str, rejected: Option<&str>) -> (String, Option<String>) {
+        (label.to_string(), rejected.map(str::to_string))
+    }
+
+    #[test]
+    fn a_grpc_worker_ends_rejected_only_when_every_feed_is_rejected() {
+        let denied = feed(FeedState::Rejected, Some("PermissionDenied: no scope"));
+        assert_eq!(
+            rejection(true, &[denied.clone(), denied.clone()]),
+            Some("PermissionDenied: no scope".to_string())
+        );
+        assert_eq!(
+            rejection(true, &[denied.clone(), feed(FeedState::Closed, None)]),
+            None
+        );
+        assert_eq!(rejection(true, &[]), None);
+        assert_eq!(rejection(false, &[denied]), None);
+        assert_eq!(
+            rejection(true, &[feed(FeedState::Failed, Some("give up"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn md_worker_exits_78_only_when_every_worker_ended_rejected() {
+        assert_eq!(
+            exit_code(&[
+                ended("solana:a", Some("denied")),
+                ended("solana:b", Some("denied"))
+            ]),
+            78
+        );
+        assert_eq!(
+            exit_code(&[ended("solana:a", Some("denied")), ended("solana:b", None)]),
+            0
+        );
+        assert_eq!(exit_code(&[ended("binance:BTC/USDT", None)]), 0);
+        assert_eq!(exit_code(&[]), 0);
     }
 }

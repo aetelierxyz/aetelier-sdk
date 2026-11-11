@@ -8,8 +8,8 @@ use aetelier_connect::framework::FeedState;
 use aetelier_connect::framework::feed::FeedSnapshot;
 use aetelier_connect::framework::grpc::GrpcConnections;
 use aetelier_connect::workers::{
-    FlushReport, MarketWorker, MarketWorkerReport, SnapshotFlusher, WorkerCommand,
-    WorkerStatus,
+    FlushReport, MarketWorker, MarketWorkerReport, SlotWindow, SnapshotFlusher,
+    WorkerCommand, WorkerStatus,
 };
 use aetelier_types::WorkerId;
 use aetelier_types::errors::PersistError;
@@ -27,7 +27,9 @@ use crate::server::{ENDPOINT, MockConnection, MockGeyser, duplex_pool, subscribe
 
 const WAIT: Duration = Duration::from_secs(60);
 
-struct RecordingFlusher(Arc<Mutex<Vec<MarketSnapshot>>>);
+type Windows = Arc<Mutex<Vec<(SlotWindow, u64)>>>;
+
+struct RecordingFlusher(Arc<Mutex<Vec<MarketSnapshot>>>, Windows);
 
 impl SnapshotFlusher for RecordingFlusher {
     fn flush_snapshots(
@@ -41,11 +43,26 @@ impl SnapshotFlusher for RecordingFlusher {
             .extend_from_slice(snapshots);
         Ok(FlushReport::default())
     }
+
+    fn flush_slot_window(
+        &self,
+        snapshots: &[MarketSnapshot],
+        output_dir: &str,
+        window: &SlotWindow,
+    ) -> Result<FlushReport, PersistError> {
+        let t_max_us = snapshots.iter().map(|snapshot| snapshot.ts_us).max();
+        self.1
+            .lock()
+            .expect("the recording is not poisoned")
+            .push((window.clone(), t_max_us.unwrap_or_default()));
+        self.flush_snapshots(snapshots, output_dir)
+    }
 }
 
 struct RunningWorker {
     status: watch::Receiver<WorkerStatus>,
     snapshots: Arc<Mutex<Vec<MarketSnapshot>>>,
+    windows: Windows,
     stop: watch::Sender<bool>,
     commands: mpsc::Sender<WorkerCommand>,
     task: JoinHandle<anyhow::Result<MarketWorkerReport>>,
@@ -56,6 +73,7 @@ struct Stopped {
     report: MarketWorkerReport,
     status: WorkerStatus,
     rows: Vec<Transaction>,
+    windows: Vec<(SlotWindow, u64)>,
     ledger: Vec<serde_json::Value>,
 }
 
@@ -87,10 +105,16 @@ impl RunningWorker {
             .flat_map(|snapshot| snapshot.transactions.iter().cloned())
             .collect();
         let status = self.status.borrow().clone();
+        let windows = self
+            .windows
+            .lock()
+            .expect("the recording is not poisoned")
+            .clone();
         Stopped {
             report,
             status,
             rows,
+            windows,
             ledger: ledger_lines(&self.ledger),
         }
     }
@@ -148,6 +172,7 @@ fn start(
 ) -> RunningWorker {
     let address = ChainAddress::solana(&config.common.symbol).expect("a solana address");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let windows = Windows::default();
     let initial = WorkerStatus::initial(
         WorkerId::new(),
         Exchange::Solana,
@@ -165,7 +190,10 @@ fn start(
     let (commands, received) = mpsc::channel(4);
     let worker = MarketWorker::from_config_with_flusher(
         config,
-        Some(Box::new(RecordingFlusher(snapshots.clone()))),
+        Some(Box::new(RecordingFlusher(
+            snapshots.clone(),
+            windows.clone(),
+        ))),
     )
     .expect("the worker builds")
     .with_grpc_connections(pool.clone())
@@ -174,6 +202,7 @@ fn start(
     RunningWorker {
         status,
         snapshots,
+        windows,
         stop,
         commands,
         task: tokio::spawn(worker.run(shutdown)),
@@ -489,6 +518,7 @@ async fn a_rejected_stream_leaves_the_worker_rejected_and_disconnected_without_a
     }
     assert_eq!(status.reconnect_count, 0);
     assert_eq!(ended.report.ingestion.reconnect_count, 0);
+    assert_eq!(ended.report.feeds, status.feeds);
     assert_eq!(positions(&ended.rows), [(102, 0)]);
     sleep(Duration::from_secs(120)).await;
     assert_eq!(mock.subscribes().len(), 1);
@@ -665,4 +695,48 @@ async fn a_bank_cut_by_a_pause_closes_the_feed_partial() {
         cut += usize::from(kept > 0 && kept < BANK_ROWS);
     }
     assert!(cut > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quiet_solana_worker_flushes_windows_with_its_address_and_the_newest_slot_at_their_end()
+ {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let mock = MockGeyser::default();
+    let (pool, _dial) = duplex_pool(&mock);
+    let chain = Chain::recent();
+    let mut worker = start(
+        configs(dir.path(), &entry(1, "")).remove(0),
+        &pool,
+        dir.path(),
+    );
+    let mut connection = subscribed(&mock).await;
+    connection.send_all([chain.meta(100), chain.meta(101)]);
+    for slot in 102..=106 {
+        connection.send_all(chain.bank(slot, &[]));
+    }
+    settle(&mut connection).await;
+    worker.until(|status| status.total_events == 5).await;
+    let stopped = worker.stop().await;
+
+    assert!(stopped.rows.is_empty());
+    assert!(
+        stopped
+            .windows
+            .iter()
+            .all(|(window, _)| window.symbol == address(1).to_base58())
+    );
+    assert_eq!(
+        stopped
+            .windows
+            .iter()
+            .map(|(window, _)| window.last_tick.map(|tick| tick.slot))
+            .collect::<Vec<_>>(),
+        [None, Some(102), Some(103), Some(104), Some(105)]
+    );
+    for (window, t_max_us) in &stopped.windows {
+        if let Some(tick) = window.last_tick {
+            assert_eq!(tick.block_height, Chain::height(tick.slot));
+            assert_eq!(tick.block_time_us, *t_max_us);
+        }
+    }
 }

@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::workers::OutputSinkConfig;
 use crate::framework::model::DomainEvent;
+use crate::framework::slotbook::SlotTick;
 use crate::sources::ExchangeEvent;
 use crate::workers::topic_publisher::{
     DEFAULT_SNAPSHOT_CHANNEL_CAPACITY, DomainTopicMessage, DomainTopicRegistry,
@@ -148,6 +149,11 @@ pub trait OutputSink: Send + Sync {
         received_at_us: u64,
     ) -> anyhow::Result<()> {
         let _ = (topic, event, received_at_us);
+        Ok(())
+    }
+
+    fn emit_slot_tick(&self, symbol: &str, tick: SlotTick) -> anyhow::Result<()> {
+        let _ = (symbol, tick);
         Ok(())
     }
 
@@ -609,6 +615,47 @@ pub trait SnapshotFlusher: Send + Sync {
         snapshots: &[MarketSnapshot],
         output_dir: &str,
     ) -> Result<FlushReport, aetelier_types::errors::PersistError>;
+
+    fn flush_slot_window(
+        &self,
+        snapshots: &[MarketSnapshot],
+        output_dir: &str,
+        window: &SlotWindow,
+    ) -> Result<FlushReport, aetelier_types::errors::PersistError> {
+        let _ = window;
+        self.flush_snapshots(snapshots, output_dir)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotWindow {
+    pub symbol: String,
+    pub last_tick: Option<SlotTick>,
+}
+
+struct SlotCursor {
+    symbol: String,
+    ticks: std::collections::VecDeque<SlotTick>,
+}
+
+impl SlotCursor {
+    fn at_or_before(&self, ts_us: u64) -> Option<SlotTick> {
+        self.ticks
+            .iter()
+            .rev()
+            .find(|tick| tick.block_time_us <= ts_us)
+            .copied()
+    }
+
+    fn settle(&mut self, ts_us: u64) {
+        while self
+            .ticks
+            .get(1)
+            .is_some_and(|next| next.block_time_us <= ts_us)
+        {
+            self.ticks.pop_front();
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -649,6 +696,7 @@ pub struct BufferedSink {
     flush_callback: Option<BufferedSinkFlushCallback>,
     declared: DeclaredSetAlias,
     undeclared_stripped: AtomicU64,
+    slots: std::sync::Mutex<Option<SlotCursor>>,
 }
 
 /// Hard cap on buffered snapshots before the oldest are dropped. At the 250 ms
@@ -673,7 +721,20 @@ impl BufferedSink {
             flush_callback: None,
             declared: DeclaredSetAlias::all(),
             undeclared_stripped: AtomicU64::new(0),
+            slots: std::sync::Mutex::new(None),
         }
+    }
+
+    fn slot_window(&self, snapshots: &[MarketSnapshot]) -> Option<SlotWindow> {
+        let t_max_us = snapshots.iter().map(|snapshot| snapshot.ts_us).max()?;
+        let slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.as_ref().map(|cursor| SlotWindow {
+            symbol: cursor.symbol.clone(),
+            last_tick: cursor.at_or_before(t_max_us),
+        })
     }
 
     pub fn with_declared(mut self, declared: DeclaredSetAlias) -> Self {
@@ -814,7 +875,33 @@ impl OutputSink for BufferedSink {
                 "buffered_sink.buffer_full_dropping_oldest"
             );
         }
+        let ts_us = snapshot.ts_us;
         buf.push(snapshot);
+        if let Some(cursor) = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            cursor.settle(ts_us);
+        }
+        Ok(())
+    }
+
+    fn emit_slot_tick(&self, symbol: &str, tick: SlotTick) -> anyhow::Result<()> {
+        use aetelier_types::config::markets::market_config::DeclaredDatatype as DD;
+        if !self.declared.contains(DD::Transactions) {
+            return Ok(());
+        }
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| SlotCursor {
+                symbol: symbol.to_string(),
+                ticks: std::collections::VecDeque::new(),
+            })
+            .ticks
+            .push_back(tick);
         Ok(())
     }
 
@@ -824,9 +911,16 @@ impl OutputSink for BufferedSink {
             return Ok(());
         }
 
+        let flushed = match self.slot_window(&buf) {
+            Some(window) => {
+                self.flusher
+                    .flush_slot_window(&buf, &self.output_dir, &window)
+            }
+            None => self.flusher.flush_snapshots(&buf, &self.output_dir),
+        };
         // On a write failure the buffer is retained (not cleared) and the error
         // propagates so the caller can retry at the next threshold; count it.
-        let report = match self.flusher.flush_snapshots(&buf, &self.output_dir) {
+        let report = match flushed {
             Ok(report) => report,
             Err(e) => {
                 self.flush_failures.fetch_add(1, Ordering::Relaxed);
@@ -987,6 +1081,19 @@ impl OutputSinkSet {
                     sink = sink.name(),
                     error = %e,
                     "output_sink_set.emit_snapshot_failed"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn emit_slot_tick(&self, symbol: &str, tick: SlotTick) -> anyhow::Result<()> {
+        for sink in &self.sinks {
+            if let Err(e) = sink.emit_slot_tick(symbol, tick) {
+                tracing::warn!(
+                    sink = sink.name(),
+                    error = %e,
+                    "output_sink_set.emit_slot_tick_failed"
                 );
             }
         }
@@ -1505,5 +1612,128 @@ mod tests {
         TerminalSink::new()
             .emit_domain("trade.all.BTCUSDT", &ev, 0)
             .unwrap();
+    }
+
+    const JUPITER: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+
+    type Windows = std::sync::Arc<std::sync::Mutex<Vec<Option<SlotWindow>>>>;
+
+    struct WindowFlusher(Windows);
+
+    impl SnapshotFlusher for WindowFlusher {
+        fn flush_snapshots(
+            &self,
+            _snapshots: &[MarketSnapshot],
+            _output_dir: &str,
+        ) -> Result<FlushReport, aetelier_types::errors::PersistError> {
+            self.0.lock().unwrap().push(None);
+            Ok(FlushReport::default())
+        }
+
+        fn flush_slot_window(
+            &self,
+            _snapshots: &[MarketSnapshot],
+            _output_dir: &str,
+            window: &SlotWindow,
+        ) -> Result<FlushReport, aetelier_types::errors::PersistError> {
+            self.0.lock().unwrap().push(Some(window.clone()));
+            Ok(FlushReport::default())
+        }
+    }
+
+    fn window_sink() -> (BufferedSink, Windows) {
+        let windows = Windows::default();
+        let sink = BufferedSink::new(
+            "/tmp/test".into(),
+            Box::new(WindowFlusher(windows.clone())),
+        );
+        (sink, windows)
+    }
+
+    fn tick(slot: u64, block_time_us: u64) -> SlotTick {
+        SlotTick {
+            slot,
+            block_height: slot - 22_000_000,
+            block_time_us,
+        }
+    }
+
+    fn jupiter_window(last_tick: Option<SlotTick>) -> Option<SlotWindow> {
+        Some(SlotWindow {
+            symbol: JUPITER.to_string(),
+            last_tick,
+        })
+    }
+
+    #[test]
+    fn a_flush_carries_the_newest_slot_tick_at_or_before_the_window_end() {
+        let (sink, windows) = window_sink();
+        for (slot, block_time_us) in [
+            (380_000_000, 1_000_000),
+            (380_000_001, 2_000_000),
+            (380_000_002, 2_000_000),
+            (380_000_003, 3_500_000),
+        ] {
+            sink.emit_slot_tick(JUPITER, tick(slot, block_time_us))
+                .unwrap();
+        }
+        sink.emit_snapshot(&MarketSnapshot::empty(1_000_000))
+            .unwrap();
+        sink.emit_snapshot(&MarketSnapshot::empty(2_000_000))
+            .unwrap();
+        sink.flush().unwrap();
+        sink.emit_slot_tick(JUPITER, tick(380_000_004, 5_000_000))
+            .unwrap();
+        sink.emit_snapshot(&MarketSnapshot::empty(3_000_000))
+            .unwrap();
+        sink.flush().unwrap();
+        sink.emit_snapshot(&MarketSnapshot::empty(4_000_000))
+            .unwrap();
+        sink.flush().unwrap();
+
+        assert_eq!(
+            *windows.lock().unwrap(),
+            vec![
+                jupiter_window(Some(tick(380_000_002, 2_000_000))),
+                jupiter_window(Some(tick(380_000_002, 2_000_000))),
+                jupiter_window(Some(tick(380_000_003, 3_500_000))),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_ending_before_every_slot_tick_carries_no_slot() {
+        let (sink, windows) = window_sink();
+        sink.emit_slot_tick(JUPITER, tick(380_000_000, 5_000_000))
+            .unwrap();
+        sink.emit_snapshot(&MarketSnapshot::empty(3_000_000))
+            .unwrap();
+        sink.flush().unwrap();
+
+        assert_eq!(*windows.lock().unwrap(), vec![jupiter_window(None)]);
+    }
+
+    #[test]
+    fn a_sink_without_slot_ticks_or_without_transactions_flushes_as_before() {
+        use aetelier_types::config::markets::market_config::DeclaredDatatype as DD;
+        let (cex, cex_windows) = window_sink();
+        cex.emit_snapshot(&dummy_snapshot()).unwrap();
+        cex.flush().unwrap();
+        assert_eq!(*cex_windows.lock().unwrap(), vec![None]);
+
+        let windows = Windows::default();
+        let undeclared = BufferedSink::new(
+            "/tmp/test".into(),
+            Box::new(WindowFlusher(windows.clone())),
+        )
+        .with_declared(DeclaredSetAlias::all().without(DD::Transactions));
+        undeclared
+            .emit_slot_tick(JUPITER, tick(380_000_000, 1_000_000))
+            .unwrap();
+        undeclared
+            .emit_snapshot(&MarketSnapshot::empty(2_000_000))
+            .unwrap();
+        undeclared.flush().unwrap();
+        assert_eq!(*windows.lock().unwrap(), vec![None]);
     }
 }

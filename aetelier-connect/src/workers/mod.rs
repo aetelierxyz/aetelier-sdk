@@ -31,7 +31,7 @@ pub use ingestion_core::{IngestionCore, IngestionReport};
 pub use market_worker::{MarketWorker, MarketWorkerReport};
 pub use output::{
     BufferedSink, BufferedSinkFlushCallback, BufferedSinkFlushEvent, FlushReport,
-    OutputSink, OutputSinkSet, SinkState, SinkStatus, SnapshotFlusher,
+    OutputSink, OutputSinkSet, SinkState, SinkStatus, SlotWindow, SnapshotFlusher,
     TerminalEventCallback, TerminalSink, TerminalSinkRawEvent, build_sinks,
 };
 pub use pipeline::{EventPipeline, PassthroughPipeline, build_pipeline};
