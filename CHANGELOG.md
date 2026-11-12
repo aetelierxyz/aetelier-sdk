@@ -12,7 +12,7 @@ entry is edited only to correct a factual error, never to restate its scope.
 
 ### Promotions
 
-- 2026-11-12 · `feature/onchain-solana` — the `solana` venue over Yellowstone gRPC (feature `grpc`): `transactions.v1` Parquet, the slot clock, slot heartbeats on quiet windows; `md_worker` exits `78` when every worker is rejected.
+- 2026-11-12 · `feature/onchain-solana` (#30) — the `solana` venue over Yellowstone gRPC (feature `grpc`): `transactions.v1` Parquet, the slot clock, slot heartbeats on quiet windows; `md_worker` exits `78` when every worker is rejected.
 
 ### Added
 
