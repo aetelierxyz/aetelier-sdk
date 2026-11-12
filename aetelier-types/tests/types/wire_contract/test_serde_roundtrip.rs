@@ -204,3 +204,35 @@ fn market_type_from_str_loose_known_and_unknown() {
     assert_eq!(MarketType::from_str_loose(""), None);
     assert_eq!(MarketType::from_str_loose("options"), None);
 }
+
+#[test]
+fn onchain_venue_wire_forms() {
+    let venue = serde_json::to_string(&Exchange::Solana).unwrap();
+    assert_eq!(venue, r#""solana""#);
+    let back: Exchange = serde_json::from_str(&venue).unwrap();
+    assert_eq!(back, Exchange::Solana);
+
+    let market = serde_json::to_string(&MarketType::Onchain).unwrap();
+    assert_eq!(market, r#""onchain""#);
+    let back: MarketType = serde_json::from_str(&market).unwrap();
+    assert_eq!(back, MarketType::Onchain);
+}
+
+#[test]
+fn slot_driven_round_trips_by_variant_name() {
+    let json = serde_json::to_string(&ClockMode::SlotDriven).unwrap();
+    assert_eq!(json, r#""SlotDriven""#);
+    let back: ClockMode = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, ClockMode::SlotDriven);
+
+    let mode = WorkerMode::Clock {
+        clock: ClockMode::SlotDriven,
+        period_us: 1_000_000,
+    };
+    let json = serde_json::to_string(&mode).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["Clock"]["clock"], "SlotDriven");
+    assert_eq!(v["Clock"]["period_us"], 1_000_000u64);
+    let back: WorkerMode = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, mode);
+}

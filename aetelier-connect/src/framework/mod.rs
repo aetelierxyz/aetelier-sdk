@@ -23,12 +23,16 @@ pub mod checksum;
 pub mod driver;
 pub mod entrepot;
 pub mod feed;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 pub mod model;
+pub mod onchain;
 pub mod protocol;
 pub mod reconcile;
 pub mod registry;
 pub mod rest;
 pub mod runtime;
+pub mod slotbook;
 pub mod symbol;
 pub mod transport;
 
@@ -46,5 +50,10 @@ pub use protocol::{
 };
 pub use registry::{ExchangeAdapter, ExchangeProfile, TaskExit, registry, resolve};
 pub use rest::{GenericRestSnapshot, RestSnapshot};
+pub use slotbook::{
+    BlockContext, BlockMeta, CoverageStart, ReleasedBank, SlotApply, SlotBookConfig,
+    SlotBookCounters, SlotBookState, SlotGap, SlotPosition, SlotSeal, SlotTick,
+    SourcedSlotbook, TxApply,
+};
 pub use symbol::SymbolCodec;
 pub use transport::WssTransport;

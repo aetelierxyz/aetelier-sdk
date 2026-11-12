@@ -173,6 +173,7 @@ impl EventSynchronizer {
             funding_rate: self.current_funding_rates.clone(),
             open_interest: self.current_open_interests.clone(),
             funding_settlements: Vec::new(),
+            transactions: Vec::new(),
         };
         self.buffer.push(snap);
         self.total_captured += 1;

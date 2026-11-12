@@ -129,6 +129,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         assert!(snap.has_data());
     }
@@ -143,6 +144,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         assert!(snap.has_data());
     }
@@ -157,6 +159,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         assert!(snap.has_data());
     }
@@ -171,6 +174,7 @@ mod tests {
             funding_rate: vec![make_fr(1, 0.0001)],
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         assert!(snap.has_data());
     }
@@ -185,6 +189,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: vec![make_oi(1, 1000.0, 50_000_000.0)],
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         assert!(snap.has_data());
     }
@@ -207,6 +212,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         let vol = snap.trade_volume();
         assert!((vol - 2.25).abs() < f64::EPSILON);
@@ -222,6 +228,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         assert_eq!(snap.trade_count(), 2);
     }
@@ -239,6 +246,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         let notional = snap.liquidation_notional();
         assert!((notional - 130_000.0).abs() < f64::EPSILON);
@@ -272,6 +280,7 @@ mod tests {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: vec![],
+            transactions: Vec::new(),
         };
         let agg = MarketAggregate::from_snapshot(&snap, 0.0);
 

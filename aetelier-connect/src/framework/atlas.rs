@@ -28,6 +28,26 @@ pub const ENFORCED: &[&str] = &[
     "DAT-SK-T-16",   // gap incident appended to the JSONL gap ledger
     "DAT-RC-INV-2",  // reconcile fetches are incident/sweep-bounded
     "DAT-RC-INV-4",  // recovery counters never rewrite loss accounting
+    "DAT-F-T-3",
+    "DAT-F-INV-4",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-1",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-2",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-3",
+    #[cfg(feature = "grpc")]
+    "DAT-TX-INV-4",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-INV-1",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-INV-2",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-T-1",
+    #[cfg(feature = "grpc")]
+    "DAT-SB-T-2",
+    #[cfg(feature = "grpc")]
+    "DAT-SY-INV-25",
 ];
 
 /// `SourceMetrics` snapshot field -> the invariant id(s) that counter
@@ -52,6 +72,8 @@ pub const METRIC_EMITTERS: &[(&str, &[&str])] = &[
     ("trades_recovered", &["DAT-RC-INV-4"]),
     ("reconcile_fetches", &["DAT-RC-INV-2", "DAT-RC-INV-4"]),
     ("reconcile_failures", &["DAT-RC-INV-4"]),
+    ("slot_gaps", &["DAT-SK-T-16"]),
+    ("blocks_lost", &["DAT-SK-T-16"]),
 ];
 
 /// Validate an id against the shape documented above, without a regex

@@ -5,31 +5,60 @@
 //! Registered in `KINDS`; the `conformance_suite!` macro instantiates every
 //! entry for every venue, so adding a kind here ratchets it to all venues.
 
+use aetelier_connect::framework::budget::SourceMetricsSnapshot;
 use aetelier_connect::framework::model::{
     DomainEvent, OrderBookState, ReconstructionModel, SourcedOrderbook,
 };
-use aetelier_connect::framework::registry::registry;
+use aetelier_connect::framework::registry::{ExchangeAdapter, ReplayFrame, registry};
+use aetelier_connect::framework::runtime::{ReconstructedEvent, RuntimeOutcome};
+use aetelier_types::Instrument;
+use aetelier_types::config::markets::market_config::{
+    DataTypesSection, DeclaredSet, TransactionsConfig,
+};
+use aetelier_types::onchain::Commitment;
 use aetelier_types::orderbooks::NormalizedDelta;
 use aetelier_types::trading_pair::TradingPair;
 use rust_decimal::Decimal;
 
 use super::harness::{
-    Class, Kind, Outcome, VenueConformance, fixture_lines, fixture_raw,
+    CAPTURES_NOT_DISTRIBUTED, Class, ExpectInstrument, Kind, Outcome, StreamFixture,
+    VenueConformance, fixture_lines, fixture_present, fixture_raw, stream_frames,
 };
+
+fn stateless_replay_applies(model: &ReconstructionModel) -> Result<(), Outcome> {
+    match model {
+        ReconstructionModel::FullRefresh
+        | ReconstructionModel::SeqDelta { .. }
+        | ReconstructionModel::ChecksumDelta { .. }
+        | ReconstructionModel::L3 { .. } => Ok(()),
+        ReconstructionModel::Stream => Err(Outcome::NotApplicable(
+            "stream model: frames replay through replay_stream, not replay_frame".into(),
+        )),
+    }
+}
 
 /// Replay every fixture frame through the adapter's real decode+normalize
 /// path; collect the DomainEvents. Errors surface the venue id + the frame.
-fn replay_all(desc: &VenueConformance) -> Result<Vec<DomainEvent>, String> {
-    let adapter = *registry().get(desc.venue).unwrap();
-    let lines = fixture_lines(desc.ws_fixture)?;
+fn replay_all(desc: &VenueConformance) -> Result<Vec<DomainEvent>, Outcome> {
+    replay_fixture(*registry().get(desc.venue).unwrap(), desc.ws_fixture)
+}
+
+fn replay_fixture(
+    adapter: &dyn ExchangeAdapter,
+    ws_fixture: &str,
+) -> Result<Vec<DomainEvent>, Outcome> {
+    stateless_replay_applies(&adapter.book_model("orders"))?;
+    let lines = fixture_lines(ws_fixture).map_err(Outcome::Fail)?;
     if lines.is_empty() {
-        return Err(format!("fixture {} has no frames", desc.ws_fixture));
+        return Err(Outcome::Fail(format!("fixture {ws_fixture} has no frames")));
     }
     let mut events = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         match adapter.replay_frame(line) {
             Ok(mut evs) => events.append(&mut evs),
-            Err(e) => return Err(format!("frame {i} failed to decode: {e}")),
+            Err(e) => {
+                return Err(Outcome::Fail(format!("frame {i} failed to decode: {e}")));
+            }
         }
     }
     Ok(events)
@@ -45,7 +74,7 @@ fn derivative_invariants(desc: &VenueConformance) -> Outcome {
     }
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let mut fr_seen = 0usize;
     let mut oi_seen = 0usize;
@@ -104,6 +133,11 @@ fn class_of(ev: &DomainEvent) -> Option<Class> {
         DomainEvent::FundingRate(_) => Some(Class::FundingRate),
         DomainEvent::OpenInterest(_) => Some(Class::OpenInterest),
         DomainEvent::FundingSettlement(_) => Some(Class::FundingSettlement),
+        DomainEvent::Transaction(_) => Some(Class::Transaction),
+        DomainEvent::SlotTick(_)
+        | DomainEvent::SlotGap(_)
+        | DomainEvent::ConnectionLost { .. }
+        | DomainEvent::ConnectionResumed => None,
     }
 }
 
@@ -114,7 +148,7 @@ fn class_of(ev: &DomainEvent) -> Option<Class> {
 fn decode_surface(desc: &VenueConformance) -> Outcome {
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     if events.is_empty() {
         return Outcome::Fail("no DomainEvents produced from the fixture".into());
@@ -146,6 +180,9 @@ fn decode_surface(desc: &VenueConformance) -> Outcome {
 fn seeding_taxonomy(desc: &VenueConformance) -> Outcome {
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
+    if !model.reconstructs_books() {
+        return Outcome::NotApplicable("stream model: no order book to seed".into());
+    }
     if !desc.expect_source.matches(model.snapshot_source()) {
         return Outcome::Fail(format!(
             "snapshot source: doc expects {:?}, model has {:?}",
@@ -204,14 +241,38 @@ fn seeding_taxonomy(desc: &VenueConformance) -> Outcome {
 fn symbol_canonicalization(desc: &VenueConformance) -> Outcome {
     let adapter = *registry().get(desc.venue).unwrap();
     let codec = &adapter.profile().symbol_codec;
-    let want = TradingPair::new(desc.canonical_base, desc.canonical_quote);
-    match codec.decode(desc.wire_symbol) {
-        Some(pair) if pair.to_canonical() == want.to_canonical() => Outcome::Pass,
-        Some(pair) => Outcome::Fail(format!(
+    let want = match desc.expect_instrument {
+        ExpectInstrument::Pair => {
+            TradingPair::new(desc.canonical_base, desc.canonical_quote).to_canonical()
+        }
+        ExpectInstrument::Address(chain) => {
+            if let Some(pair) = codec.decode(desc.wire_symbol) {
+                return Outcome::Fail(format!(
+                    "codec decoded the address {} to the pair {}",
+                    desc.wire_symbol,
+                    pair.to_canonical()
+                ));
+            }
+            if let Some(Instrument::Address(address)) =
+                codec.decode_instrument(desc.wire_symbol)
+                && address.chain() != chain
+            {
+                return Outcome::Fail(format!(
+                    "codec decoded {} on chain {:?}, doc expects {chain:?}",
+                    desc.wire_symbol,
+                    address.chain()
+                ));
+            }
+            desc.wire_symbol.to_string()
+        }
+    };
+    match codec.decode_instrument(desc.wire_symbol) {
+        Some(found) if found.canonical() == want => Outcome::Pass,
+        Some(found) => Outcome::Fail(format!(
             "codec decoded {} to {}, doc expects {}",
             desc.wire_symbol,
-            pair.to_canonical(),
-            want.to_canonical()
+            found.canonical(),
+            want
         )),
         None => Outcome::Fail(format!(
             "codec could not decode wire symbol {}",
@@ -227,7 +288,7 @@ fn symbol_canonicalization(desc: &VenueConformance) -> Outcome {
 fn trade_continuity(desc: &VenueConformance) -> Outcome {
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let seqs: Vec<u64> = events
         .iter()
@@ -272,7 +333,7 @@ fn trade_continuity(desc: &VenueConformance) -> Outcome {
 fn reconstruct_book(desc: &VenueConformance) -> Result<(SourcedOrderbook, u64), Outcome> {
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
-    let events = replay_all(desc).map_err(Outcome::Fail)?;
+    let events = replay_all(desc)?;
     let deltas: Vec<_> = events
         .into_iter()
         .filter_map(|ev| match ev {
@@ -516,7 +577,7 @@ fn trade_invariants(desc: &VenueConformance) -> Outcome {
 
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let mut seen = 0u64;
     for ev in &events {
@@ -559,7 +620,7 @@ fn checksum_validation(desc: &VenueConformance) -> Outcome {
     }
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     let deltas: Vec<_> = events
         .into_iter()
@@ -633,7 +694,7 @@ fn seeded_book_and_deltas(
 ) -> Result<(SourcedOrderbook, Vec<NormalizedDelta>), Outcome> {
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
-    let events = replay_all(desc).map_err(Outcome::Fail)?;
+    let events = replay_all(desc)?;
     let deltas: Vec<NormalizedDelta> = events
         .into_iter()
         .filter_map(|ev| match ev {
@@ -752,6 +813,9 @@ fn gap_detection(desc: &VenueConformance) -> Outcome {
             );
         }
         ReconstructionModel::SeqDelta { .. } => {}
+        ReconstructionModel::Stream => {
+            return Outcome::NotApplicable("stream model: no order book to gap".into());
+        }
     }
 
     let (mut book, post) = match seeded_book_and_deltas(desc) {
@@ -810,7 +874,7 @@ fn book_runtime_replay(desc: &VenueConformance) -> Outcome {
     let model = adapter.book_model("orders");
     let events = match replay_all(desc) {
         Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
+        Err(o) => return o,
     };
     if !events.iter().any(|ev| matches!(ev, DomainEvent::Book(_))) {
         if desc.expect_classes.contains(&Class::Book) {
@@ -944,6 +1008,7 @@ fn canon_frame(raw: &str) -> Option<serde_json::Value> {
 fn run_fixture_runtime(
     desc: &VenueConformance,
     declared: aetelier_connect::framework::protocol::DeclaredSet,
+    feeds: Option<aetelier_connect::framework::feed::SharedFeedSet>,
 ) -> Result<
     (
         u64,
@@ -958,7 +1023,7 @@ fn run_fixture_runtime(
 
     let adapter = *registry().get(desc.venue).unwrap();
     let model = adapter.book_model("orders");
-    let events = replay_all(desc).map_err(Outcome::Fail)?;
+    let events = replay_all(desc)?;
 
     struct FixedSeeder2(NormalizedDelta);
 
@@ -999,6 +1064,10 @@ fn run_fixture_runtime(
             metrics.clone(),
             declared,
         );
+        let runtime = match feeds {
+            Some(feeds) => runtime.with_feeds(feeds),
+            None => runtime,
+        };
         let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(events.len() + 1);
         for ev in events {
             if ev_tx.send(ev).await.is_err() {
@@ -1025,8 +1094,225 @@ fn run_fixture_runtime(
     })
 }
 
+pub fn stream_fixtures(
+    desc: &VenueConformance,
+) -> Result<&'static [StreamFixture], Outcome> {
+    let adapter = *registry().get(desc.venue).unwrap();
+    if !matches!(adapter.book_model("orders"), ReconstructionModel::Stream) {
+        return Err(Outcome::NotApplicable(
+            "book venue: no on-chain stream to replay".into(),
+        ));
+    }
+    if desc.stream_fixtures.is_empty() {
+        return Err(Outcome::Fail(
+            "stream venue declares no stream fixture".into(),
+        ));
+    }
+    if !desc
+        .stream_fixtures
+        .iter()
+        .any(|fixture| fixture_present(fixture.file))
+    {
+        return Err(Outcome::NotApplicable(format!(
+            "the {} {CAPTURES_NOT_DISTRIBUTED}: place them under datasets/{}/ to replay them",
+            desc.venue, desc.venue
+        )));
+    }
+    Ok(desc.stream_fixtures)
+}
+
+fn stream_datatypes(transactions: TransactionsConfig) -> DataTypesSection {
+    DataTypesSection {
+        transactions: TransactionsConfig {
+            enabled: true,
+            ..transactions
+        },
+        ..DataTypesSection::default()
+    }
+}
+
+pub fn replay_stream_frames(
+    desc: &VenueConformance,
+    symbols: &[String],
+    commitment: Commitment,
+    frames: &[ReplayFrame],
+    transactions: TransactionsConfig,
+) -> Result<(Vec<DomainEvent>, SourceMetricsSnapshot), Outcome> {
+    use aetelier_connect::framework::budget::SourceMetrics;
+    let adapter = *registry().get(desc.venue).unwrap();
+    let metrics = SourceMetrics::default();
+    let events = adapter
+        .replay_stream(
+            symbols,
+            &stream_datatypes(transactions),
+            commitment,
+            frames,
+            &metrics,
+        )
+        .map_err(|e| Outcome::Fail(format!("stream replay failed: {e}")))?;
+    Ok((events, metrics.snapshot()))
+}
+
+fn replay_stream_fixture(
+    desc: &VenueConformance,
+    fixture: &StreamFixture,
+    transactions: TransactionsConfig,
+) -> Result<(Vec<DomainEvent>, SourceMetricsSnapshot), Outcome> {
+    let frames = stream_frames(fixture.file).map_err(Outcome::Fail)?;
+    replay_stream_frames(
+        desc,
+        &[fixture.watched.to_string()],
+        fixture.commitment,
+        &frames,
+        transactions,
+    )
+    .map_err(|outcome| match outcome {
+        Outcome::Fail(reason) => Outcome::Fail(format!("{}: {reason}", fixture.file)),
+        other => other,
+    })
+}
+
+pub fn run_stream_runtime(
+    desc: &VenueConformance,
+    symbols: Vec<String>,
+    events: Vec<DomainEvent>,
+    declared: DeclaredSet,
+    feeds: Option<aetelier_connect::framework::feed::SharedFeedSet>,
+    mut on_event: impl FnMut(ReconstructedEvent),
+) -> Result<(RuntimeOutcome, SourceMetricsSnapshot), Outcome> {
+    use aetelier_connect::framework::budget::SourceMetrics;
+    use aetelier_connect::framework::runtime::SourceRuntime;
+
+    let adapter = *registry().get(desc.venue).unwrap();
+    let model = adapter.book_model("orders");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|e| Outcome::Fail(format!("tokio runtime: {e}")))?;
+    rt.block_on(async move {
+        let metrics = SourceMetrics::default();
+        let runtime = SourceRuntime::new(
+            desc.venue,
+            adapter.profile().symbol_codec.clone(),
+            symbols,
+            model.clone(),
+            model.recovery_action(),
+            metrics.clone(),
+            declared,
+        );
+        let runtime = match feeds {
+            Some(feeds) => runtime.with_feeds(feeds),
+            None => runtime,
+        };
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(events.len() + 1);
+        for ev in events {
+            if ev_tx.send(ev).await.is_err() {
+                return Err(Outcome::Fail("runtime event channel closed early".into()));
+            }
+        }
+        drop(ev_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4096);
+        let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(runtime.run(ev_rx, None, out_tx, sd_rx));
+        while let Some(ev) = out_rx.recv().await {
+            on_event(ev);
+        }
+        let outcome = run
+            .await
+            .map_err(|e| Outcome::Fail(format!("runtime task panicked: {e}")))?;
+        Ok((outcome, metrics.snapshot()))
+    })
+}
+
+fn stream_feed_lifecycle(
+    desc: &VenueConformance,
+    venue: aetelier_types::exchanges::Exchange,
+    declared: &DeclaredSet,
+) -> Outcome {
+    use aetelier_connect::framework::feed::{FeedSet, FeedState};
+
+    let fixtures = match stream_fixtures(desc) {
+        Ok(f) => f,
+        Err(o) => return o,
+    };
+    let adapter = *registry().get(desc.venue).unwrap();
+    for fixture in fixtures {
+        let Some(instrument) = adapter
+            .profile()
+            .symbol_codec
+            .decode_instrument(fixture.watched)
+        else {
+            return Outcome::Fail(format!(
+                "{}: codec could not decode the watched address {}",
+                fixture.file, fixture.watched
+            ));
+        };
+        let feeds = FeedSet::for_declared(venue, &instrument, declared).into_shared();
+        let expected = match feeds.lock() {
+            Ok(mut fs) => {
+                fs.mark_all_subscribing();
+                fs.snapshot().len()
+            }
+            Err(e) => return Outcome::Fail(format!("feed set lock poisoned: {e}")),
+        };
+        if expected == 0 {
+            return Outcome::Fail("the declared classes build no feed".into());
+        }
+        let events =
+            match replay_stream_fixture(desc, fixture, TransactionsConfig::default()) {
+                Ok((events, _)) => events,
+                Err(o) => return o,
+            };
+        match run_stream_runtime(
+            desc,
+            vec![fixture.watched.to_string()],
+            events,
+            declared.clone(),
+            Some(feeds.clone()),
+            |_| {},
+        ) {
+            Ok((RuntimeOutcome::Finished, _)) => {}
+            Ok((outcome, _)) => {
+                return Outcome::Fail(format!(
+                    "{}: runtime ended {outcome:?} replaying the committed capture",
+                    fixture.file
+                ));
+            }
+            Err(o) => return o,
+        }
+        let snapshot = match feeds.lock() {
+            Ok(fs) => fs.snapshot(),
+            Err(e) => return Outcome::Fail(format!("feed set lock poisoned: {e}")),
+        };
+        let canonical = instrument.canonical();
+        for feed in &snapshot {
+            if feed.state != FeedState::Live {
+                return Outcome::Fail(format!(
+                    "{}: {:?} feed ended {:?}, not Live",
+                    fixture.file, feed.datatype, feed.state
+                ));
+            }
+            if feed.instrument != canonical {
+                return Outcome::Fail(format!(
+                    "{}: {:?} feed reports instrument {}, decoded {canonical}",
+                    fixture.file, feed.datatype, feed.instrument
+                ));
+            }
+        }
+    }
+    Outcome::Pass
+}
+
 fn datatype_isolation(desc: &VenueConformance) -> Outcome {
     use aetelier_connect::framework::protocol::{DeclaredDatatype, DeclaredSet};
+    if registry()
+        .get(desc.venue)
+        .is_some_and(|adapter| adapter.supported_datatypes().len() < 2)
+    {
+        return Outcome::NotApplicable(
+            "the venue supports a single datatype: nothing to isolate".into(),
+        );
+    }
     if !desc.datatype_isolation_done {
         return Outcome::NotApplicable(
             "declared-datatype subscribe filtering (C1) not yet enforced for this venue"
@@ -1125,7 +1411,8 @@ fn datatype_isolation(desc: &VenueConformance) -> Outcome {
         }
     }
 
-    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Orderbook)) {
+    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Orderbook), None)
+    {
         Ok((_books, 0, _)) => {}
         Ok((_, trades, _)) => {
             return Outcome::Fail(format!(
@@ -1134,7 +1421,7 @@ fn datatype_isolation(desc: &VenueConformance) -> Outcome {
         }
         Err(o) => return o,
     }
-    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Trades)) {
+    match run_fixture_runtime(desc, DeclaredSet::only(DeclaredDatatype::Trades), None) {
         Ok((books, _trades, outcome)) => {
             if books != 0 {
                 return Outcome::Fail(format!(
@@ -1151,6 +1438,85 @@ fn datatype_isolation(desc: &VenueConformance) -> Outcome {
             }
         }
         Err(o) => return o,
+    }
+    Outcome::Pass
+}
+
+fn feed_lifecycle(desc: &VenueConformance) -> Outcome {
+    use aetelier_connect::framework::feed::{FeedSet, FeedState};
+    use aetelier_connect::framework::protocol::{DeclaredDatatype, DeclaredSet};
+    use aetelier_connect::framework::runtime::RuntimeOutcome;
+    use aetelier_types::exchanges::Exchange;
+
+    let adapter = *registry().get(desc.venue).unwrap();
+    let Ok(venue) = desc.venue.parse::<Exchange>() else {
+        return Outcome::Fail(format!("venue id {} names no exchange", desc.venue));
+    };
+    let declared = DeclaredDatatype::ALL
+        .into_iter()
+        .filter(|dt| {
+            let class = match dt {
+                DeclaredDatatype::Orderbook => Some(Class::Book),
+                DeclaredDatatype::Trades => Some(Class::Trade),
+                DeclaredDatatype::FundingRates => Some(Class::FundingRate),
+                DeclaredDatatype::OpenInterest => Some(Class::OpenInterest),
+                DeclaredDatatype::Transactions => Some(Class::Transaction),
+                DeclaredDatatype::Liquidations => None,
+            };
+            !class.is_some_and(|c| desc.expect_classes.contains(&c))
+        })
+        .fold(DeclaredSet::all(), |set, dt| set.without(dt));
+    if matches!(adapter.book_model("orders"), ReconstructionModel::Stream) {
+        return stream_feed_lifecycle(desc, venue, &declared);
+    }
+    let Some(instrument) = adapter
+        .profile()
+        .symbol_codec
+        .decode_instrument(desc.wire_symbol)
+    else {
+        return Outcome::Fail(format!(
+            "codec could not decode wire symbol {}",
+            desc.wire_symbol
+        ));
+    };
+    let feeds = FeedSet::for_declared(venue, &instrument, &declared).into_shared();
+    let expected = match feeds.lock() {
+        Ok(mut fs) => {
+            fs.mark_all_subscribing();
+            fs.snapshot().len()
+        }
+        Err(e) => return Outcome::Fail(format!("feed set lock poisoned: {e}")),
+    };
+    if expected == 0 {
+        return Outcome::Fail("the declared classes build no feed".into());
+    }
+    match run_fixture_runtime(desc, declared, Some(feeds.clone())) {
+        Ok((_, _, RuntimeOutcome::Finished)) => {}
+        Ok((_, _, outcome)) => {
+            return Outcome::Fail(format!(
+                "runtime ended {outcome:?} replaying the committed capture"
+            ));
+        }
+        Err(o) => return o,
+    }
+    let snapshot = match feeds.lock() {
+        Ok(fs) => fs.snapshot(),
+        Err(e) => return Outcome::Fail(format!("feed set lock poisoned: {e}")),
+    };
+    let canonical = instrument.canonical();
+    for feed in &snapshot {
+        if feed.state != FeedState::Live {
+            return Outcome::Fail(format!(
+                "{:?} feed ended {:?}, not Live",
+                feed.datatype, feed.state
+            ));
+        }
+        if feed.instrument != canonical {
+            return Outcome::Fail(format!(
+                "{:?} feed reports instrument {}, decoded {canonical}",
+                feed.datatype, feed.instrument
+            ));
+        }
     }
     Outcome::Pass
 }
@@ -1231,4 +1597,190 @@ pub const KINDS: &[Kind] = &[
         invariants: &[],
         run: derivative_invariants,
     },
+    Kind {
+        name: "feed_lifecycle",
+        atlas: "DAT-F feed lifecycle: every declared feed reaches Live under the \
+                decoded instrument, replayed through the real SourceRuntime",
+        invariants: &["DAT-F-T-3", "DAT-F-INV-4"],
+        run: feed_lifecycle,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "tx_decode_surface",
+        atlas: "DAT-TX-INV-1: every captured SubscribeUpdate replays through replay_stream; \
+                each row matches its raw update: version (v1 iff a message config, v0 iff \
+                versioned), requested compute (leading ComputeBudget bytes on legacy and v0, \
+                the message config on v1), fee_lamports = 5000 per signature (precompile \
+                signatures included) plus the priority fee, failure columns from the \
+                TransactionError and its instruction, logs stored only with logs = true; \
+                stands in for decode_surface and seeding_taxonomy on stream venues; no capture \
+                holds an undecodable error, so that path stays with the unit tests",
+        invariants: &["DAT-TX-INV-1"],
+        run: super::stream::tx_decode_surface,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "slot_assembly",
+        atlas: "DAT-SB-INV-1: rows come only from banks sealed by their blocks_meta, carry \
+                that bank's slot, height, blockhash and block time, run in (slot, tx_index) \
+                order and precede the bank's SlotTick; coverage opens two slots after a \
+                segment's first input slot; dropping one captured blocks_meta frame leaves \
+                its bank without rows and one exact SlotGap",
+        invariants: &["DAT-SB-INV-1"],
+        run: super::stream::slot_assembly,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "slot_reorder",
+        atlas: "DAT-SB-T-1: no capture holds a child bank before its parent, so captured \
+                frames are moved: a child sent ahead of its parent is Held, then released \
+                after it in height order exactly as captured; a parent sent past the reorder \
+                window lets the child release GappedFinalized with one SlotGap and is then a \
+                Duplicate without rows; SlotTick strictly in height order",
+        invariants: &["DAT-SB-T-1"],
+        run: super::stream::slot_reorder,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "tx_dedup",
+        atlas: "DAT-SB-INV-2: no capture overlaps released slots after a reconnect, so \
+                captured frames are repeated: every update delivered twice replays exactly \
+                as captured, and the banks up to the last released one, re-sent after the \
+                reconnect marker, are Duplicate and add no row; (address, signature) unique",
+        invariants: &["DAT-SB-INV-2"],
+        run: super::stream::tx_dedup,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "slot_gap_detection",
+        atlas: "DAT-SB-T-2, DAT-SK-T-16: a reconnect at tip yields exactly one SlotGap whose \
+                exclusive bounds are the last bank released before it and the first released \
+                after it, blocks_lost = next_height - prev_height - 1, counted once by the \
+                runtime and appended once to the gap ledger as GapCause::SlotGap; neither the \
+                subscribe request nor a ping carries from_slot",
+        invariants: &["DAT-SB-T-2", "DAT-SK-T-16"],
+        run: super::stream::slot_gap_detection,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "slot_tick_grid",
+        atlas: "DAT-SY-INV-25: the slot-driven grid advances only on SlotTick chain time less \
+                the emission delay: two replays of one capture build identical rows, every \
+                transaction lands in the row of its block time, and a quiet address ticks \
+                rows without transactions, so no transactions file is written",
+        invariants: &["DAT-SY-INV-25"],
+        run: super::stream::slot_tick_grid,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "shared_connection_fanout",
+        atlas: "shared gRPC connection fan-out (attach set, per-attach queues, one \
+                conn_epoch_us per physical connection): a live-connection property the geyser \
+                mock tests certify; offline replay feeds one consumer",
+        invariants: &[],
+        run: super::stream::shared_connection_fanout,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "address_match_roles",
+        atlas: "DAT-TX-INV-2: match_role is the address's strongest role (fee_payer > signer \
+                > account_key, loaded keys account_key only), account_keys keep static, \
+                loaded writable, loaded readonly order, signers are the header's signer keys, \
+                match keeps the rows whose role satisfies it, a program never signs, and the \
+                unfiltered capture replayed for an address yields its server-filtered rows",
+        invariants: &["DAT-TX-INV-2"],
+        run: super::stream::address_match_roles,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "failed_inclusion",
+        atlas: "DAT-TX-INV-3: include_failed = true leaves the server failed filter unset and \
+                keeps failed rows with their failure columns; false sends failed = false and \
+                drops failed rows locally, counted as filtered_out",
+        invariants: &["DAT-TX-INV-3"],
+        run: super::stream::failed_inclusion,
+    },
+    #[cfg(feature = "grpc")]
+    Kind {
+        name: "tx_invariants",
+        atlas: "DAT-TX-INV-4: Transaction::check_invariants and check_transactions (unique \
+                (address, signature), rising (slot, tx_index), record invariants) hold on \
+                every replayed row and on its transactions.v1 Parquet round trip",
+        invariants: &["DAT-TX-INV-4"],
+        run: super::stream::tx_invariants,
+    },
 ];
+
+#[test]
+fn stream_models_never_reach_replay_frame() {
+    use aetelier_connect::framework::budget::{ConnectionBudget, SourceMetrics};
+    use aetelier_connect::framework::protocol::DeclaredSet;
+    use aetelier_connect::framework::registry::{ExchangeProfile, TaskExit};
+    use aetelier_connect::framework::symbol::SymbolCodec;
+    use aetelier_types::onchain::Chain;
+
+    struct StreamVenue(ExchangeProfile);
+
+    impl ExchangeAdapter for StreamVenue {
+        fn id(&self) -> &'static str {
+            "solana"
+        }
+
+        fn profile(&self) -> &ExchangeProfile {
+            &self.0
+        }
+
+        fn book_model(&self, _channel: &str) -> ReconstructionModel {
+            ReconstructionModel::Stream
+        }
+
+        fn spawn(
+            &self,
+            _symbols: Vec<String>,
+            _declared: DeclaredSet,
+            _tx: tokio::sync::mpsc::Sender<DomainEvent>,
+            _shutdown: tokio::sync::watch::Receiver<bool>,
+            _metrics: SourceMetrics,
+        ) -> tokio::task::JoinHandle<TaskExit> {
+            unreachable!("conformance replays offline")
+        }
+
+        fn replay_frame(
+            &self,
+            raw: &str,
+        ) -> Result<Vec<DomainEvent>, Box<aetelier_connect::errors::ExchangeError>>
+        {
+            panic!("a stream model reached replay_frame with {raw}")
+        }
+    }
+
+    let stream = StreamVenue(ExchangeProfile {
+        id: "solana",
+        symbol_codec: SymbolCodec::ChainAddress {
+            chain: Chain::Solana,
+        },
+        budget: ConnectionBudget::default(),
+        schema_version: 1,
+        protocol_revision: "solana-stream",
+    });
+    match replay_fixture(&stream, "hyperliquid/btc_book_trade.jsonl") {
+        Err(Outcome::NotApplicable(reason)) => {
+            assert!(reason.contains("replay_stream"), "{reason}");
+        }
+        Err(other) => panic!("expected NotApplicable, got {other:?}"),
+        Ok(events) => panic!("a stream model replayed {} events", events.len()),
+    }
+    for (id, adapter) in registry() {
+        let model = adapter.book_model("orders");
+        assert_eq!(
+            stateless_replay_applies(&model).is_ok(),
+            model.reconstructs_books(),
+            "{id}"
+        );
+    }
+    let hyperliquid = *registry().get("hyperliquid").unwrap();
+    match replay_fixture(hyperliquid, "hyperliquid/btc_book_trade.jsonl") {
+        Ok(events) => assert!(!events.is_empty()),
+        Err(other) => panic!("a book venue must replay its frames: {other:?}"),
+    }
+}

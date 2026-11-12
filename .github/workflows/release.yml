@@ -33,7 +33,9 @@ jobs:
       - uses: taiki-e/install-action@9e3720000324bf314ab081346108fc3bab8d6b74 # nextest
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets --features aetelier-sdk/parquet -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --features aetelier-sdk/parquet,aetelier-sdk/grpc -- -D warnings
       - run: cargo nextest run --locked --workspace --features aetelier-sdk/parquet
+      - run: cargo nextest run --locked --workspace --features aetelier-sdk/parquet,aetelier-sdk/grpc
       - run: cargo test --locked --workspace --doc
 
   binaries:
@@ -51,7 +53,7 @@ jobs:
       - name: install rust toolchain
         run: rustup toolchain install --no-self-update
       - name: build release binaries
-        run: cargo build --locked --release -p aetelier-sdk --features parquet --bin md_worker --bin validate --bin rehydrate
+        run: cargo build --locked --release -p aetelier-sdk --features parquet,grpc --bin md_worker --bin validate --bin rehydrate
       - name: package
         run: |
           set -euo pipefail

@@ -18,8 +18,15 @@ mod coverage;
 mod harness;
 #[path = "conformance/kinds.rs"]
 mod kinds;
+#[cfg(feature = "grpc")]
+#[path = "conformance/stream.rs"]
+mod stream;
 
-use harness::{Class, ExpectSource, VenueConformance};
+#[cfg(feature = "grpc")]
+use aetelier_types::onchain::{Chain, Commitment};
+use harness::{Class, ExpectInstrument, ExpectSource, VenueConformance};
+#[cfg(feature = "grpc")]
+use harness::{ExpectGap, StreamFixture};
 
 // ── Venue descriptors (fixtures + doc-derived expectations only) ────────────
 
@@ -37,6 +44,8 @@ const BINANCE: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 // OKX and Kraken: ChecksumDelta venues (CRC32 continuity, no REST seed,
@@ -56,6 +65,8 @@ const OKX: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 const KRAKEN: VenueConformance = VenueConformance {
@@ -70,6 +81,8 @@ const KRAKEN: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 // Cycle #3: Coinbase, Bybit, Gate.io — self-seed venues with book + trade
@@ -87,6 +100,8 @@ const COINBASE: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 const BYBIT: VenueConformance = VenueConformance {
@@ -101,6 +116,8 @@ const BYBIT: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 const GATEIO: VenueConformance = VenueConformance {
@@ -115,6 +132,8 @@ const GATEIO: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 // Cycle #4 (self-seed subset): bitget, poloniex (SeqDelta ExactPrev), upbit
@@ -132,6 +151,8 @@ const BITGET: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 const POLONIEX: VenueConformance = VenueConformance {
     venue: "poloniex",
@@ -145,6 +166,8 @@ const POLONIEX: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 const UPBIT: VenueConformance = VenueConformance {
     venue: "upbit",
@@ -158,6 +181,8 @@ const UPBIT: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 const HTX: VenueConformance = VenueConformance {
     venue: "htx",
@@ -174,6 +199,8 @@ const HTX: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 // Cycle #4 (REST/L3-seeded): bitso (L3 diff-orders, seeded 0-based from a REST
@@ -193,6 +220,8 @@ const BITSO: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 // KuCoin: RangeInclusive REST-seed. The seed (level2 snapshot) is captured
 // mid-stream so its sequence lands inside the buffered delta window — the
@@ -209,6 +238,8 @@ const KUCOIN: VenueConformance = VenueConformance {
     expect_classes: &[Class::Book, Class::Trade],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
 };
 
 const HYPERLIQUID: VenueConformance = VenueConformance {
@@ -228,6 +259,112 @@ const HYPERLIQUID: VenueConformance = VenueConformance {
     ],
     done: true,
     datatype_isolation_done: true,
+    expect_instrument: ExpectInstrument::Pair,
+    stream_fixtures: &[],
+};
+
+#[cfg(feature = "grpc")]
+const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+#[cfg(feature = "grpc")]
+const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+#[cfg(feature = "grpc")]
+const RAYDIUM_SOL_USDC_POOL: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
+#[cfg(feature = "grpc")]
+const CONFIG_PROGRAM: &str = "Config1111111111111111111111111111111111111";
+
+#[cfg(feature = "grpc")]
+const SOLANA: VenueConformance = VenueConformance {
+    venue: "solana",
+    wire_symbol: JUPITER_V6,
+    canonical_base: "",
+    canonical_quote: "",
+    expect_source: ExpectSource::None,
+    expect_needs_rest: false,
+    ws_fixture: "",
+    rest_fixture: None,
+    expect_classes: &[Class::Transaction],
+    done: true,
+    datatype_isolation_done: false,
+    expect_instrument: ExpectInstrument::Address(Chain::Solana),
+    stream_fixtures: &[
+        StreamFixture {
+            file: "solana/jupiter_v6_finalized.jsonl",
+            watched: JUPITER_V6,
+            commitment: Commitment::Finalized,
+            unfiltered: None,
+            rows: 52,
+            ticks: 12,
+            gaps: &[],
+        },
+        StreamFixture {
+            file: "solana/jupiter_v6_confirmed.jsonl",
+            watched: JUPITER_V6,
+            commitment: Commitment::Confirmed,
+            unfiltered: None,
+            rows: 59,
+            ticks: 18,
+            gaps: &[],
+        },
+        StreamFixture {
+            file: "solana/raydium_amm_v4_finalized.jsonl",
+            watched: RAYDIUM_AMM_V4,
+            commitment: Commitment::Finalized,
+            unfiltered: None,
+            rows: 89,
+            ticks: 48,
+            gaps: &[],
+        },
+        StreamFixture {
+            file: "solana/raydium_sol_usdc_pool_finalized.jsonl",
+            watched: RAYDIUM_SOL_USDC_POOL,
+            commitment: Commitment::Finalized,
+            unfiltered: None,
+            rows: 38,
+            ticks: 48,
+            gaps: &[],
+        },
+        StreamFixture {
+            file: "solana/raydium_sol_usdc_pool_reconnect_finalized.jsonl",
+            watched: RAYDIUM_SOL_USDC_POOL,
+            commitment: Commitment::Finalized,
+            unfiltered: None,
+            rows: 51,
+            ticks: 36,
+            gaps: &[ExpectGap {
+                prev_slot: 467_627_260,
+                prev_height: 445_644_849,
+                next_slot: 467_627_264,
+                next_height: 445_644_853,
+            }],
+        },
+        StreamFixture {
+            file: "solana/config_program_quiet_finalized.jsonl",
+            watched: CONFIG_PROGRAM,
+            commitment: Commitment::Finalized,
+            unfiltered: None,
+            rows: 0,
+            ticks: 48,
+            gaps: &[],
+        },
+        StreamFixture {
+            file: "solana/unfiltered_finalized.jsonl",
+            watched: JUPITER_V6,
+            commitment: Commitment::Finalized,
+            unfiltered: None,
+            rows: 10,
+            ticks: 1,
+            gaps: &[],
+        },
+        StreamFixture {
+            file: "solana/jupiter_v6_paired_finalized.jsonl",
+            watched: JUPITER_V6,
+            commitment: Commitment::Finalized,
+            unfiltered: Some("solana/unfiltered_finalized.jsonl"),
+            rows: 10,
+            ticks: 1,
+            gaps: &[],
+        },
+    ],
 };
 
 /// Instantiate every kind in `kinds::KINDS` as a named `#[test]` for one
@@ -293,6 +430,60 @@ macro_rules! conformance_suite {
             fn derivative_invariants() {
                 harness::assert_kind(&$desc, kind("derivative_invariants"));
             }
+            #[test]
+            fn feed_lifecycle() {
+                harness::assert_kind(&$desc, kind("feed_lifecycle"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn tx_decode_surface() {
+                harness::assert_kind(&$desc, kind("tx_decode_surface"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn slot_assembly() {
+                harness::assert_kind(&$desc, kind("slot_assembly"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn slot_reorder() {
+                harness::assert_kind(&$desc, kind("slot_reorder"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn tx_dedup() {
+                harness::assert_kind(&$desc, kind("tx_dedup"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn slot_gap_detection() {
+                harness::assert_kind(&$desc, kind("slot_gap_detection"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn slot_tick_grid() {
+                harness::assert_kind(&$desc, kind("slot_tick_grid"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn shared_connection_fanout() {
+                harness::assert_kind(&$desc, kind("shared_connection_fanout"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn address_match_roles() {
+                harness::assert_kind(&$desc, kind("address_match_roles"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn failed_inclusion() {
+                harness::assert_kind(&$desc, kind("failed_inclusion"));
+            }
+            #[cfg(feature = "grpc")]
+            #[test]
+            fn tx_invariants() {
+                harness::assert_kind(&$desc, kind("tx_invariants"));
+            }
         }
     };
 }
@@ -310,6 +501,8 @@ conformance_suite!(htx, HTX);
 conformance_suite!(bitso, BITSO);
 conformance_suite!(kucoin, KUCOIN);
 conformance_suite!(hyperliquid, HYPERLIQUID);
+#[cfg(feature = "grpc")]
+conformance_suite!(solana, SOLANA);
 
 // ── Registry of wired venues, for the matrix meta-test ──────────────────────
 
@@ -327,6 +520,8 @@ const WIRED: &[&VenueConformance] = &[
     &BITSO,
     &KUCOIN,
     &HYPERLIQUID,
+    #[cfg(feature = "grpc")]
+    &SOLANA,
 ];
 
 /// Meta-test: emit the kinds x venues coverage matrix and enforce the ratchet
@@ -341,22 +536,34 @@ fn conformance_matrix() {
     for k in kinds::KINDS {
         println!("  {:<24} -> {}", k.name, k.atlas);
     }
+    let mut certified = std::collections::HashSet::new();
+    let mut not_replayed = std::collections::HashSet::new();
     for desc in WIRED {
+        let outcomes: Vec<harness::Outcome> =
+            kinds::KINDS.iter().map(|k| (k.run)(desc)).collect();
         let mut row = Vec::new();
-        for k in kinds::KINDS {
-            let cell = match (k.run)(desc) {
+        for (k, outcome) in kinds::KINDS.iter().zip(&outcomes) {
+            let cell = match outcome {
                 harness::Outcome::Pass => "PASS",
                 harness::Outcome::NotApplicable(_) => "n/a",
                 harness::Outcome::Skip(_) => "skip",
                 harness::Outcome::Fail(_) => "FAIL",
             };
+            if matches!(outcome, harness::Outcome::Pass) {
+                certified.insert(k.name);
+            }
+            if let harness::Outcome::NotApplicable(reason) = outcome
+                && reason.contains(harness::CAPTURES_NOT_DISTRIBUTED)
+            {
+                not_replayed.insert(k.name);
+            }
             row.push(format!("{}={}", k.name, cell));
         }
         println!("{:<10} done={} | {}", desc.venue, desc.done, row.join("  "));
 
         if desc.done {
-            for k in kinds::KINDS {
-                match (k.run)(desc) {
+            for (k, outcome) in kinds::KINDS.iter().zip(&outcomes) {
+                match outcome {
                     // Pass and NotApplicable are both green for a DONE venue;
                     // NotApplicable is a by-design non-gap, not a coverage hole.
                     harness::Outcome::Pass | harness::Outcome::NotApplicable(_) => {}
@@ -369,4 +576,16 @@ fn conformance_matrix() {
         }
     }
     println!("=====================================\n");
+    for k in kinds::KINDS.iter().filter(|k| !k.invariants.is_empty()) {
+        if !certified.contains(k.name) && not_replayed.contains(k.name) {
+            println!("{:<24} not replayed: its captures are absent", k.name);
+            continue;
+        }
+        assert!(
+            certified.contains(k.name),
+            "kind {} certifies {:?} but passes on no wired venue",
+            k.name,
+            k.invariants
+        );
+    }
 }

@@ -59,6 +59,7 @@ fn sample_config() -> MarketSnapshotConfig {
             liquidations: FeedToggle { enabled: true },
             funding_rates: FeedToggle { enabled: false },
             open_interest: FeedToggle { enabled: false },
+            transactions: Default::default(),
         },
         output: OutputSection {
             dir: "/tmp/test".into(),
@@ -464,6 +465,7 @@ fn coinbase_config() -> MarketSnapshotConfig {
             liquidations: FeedToggle { enabled: false },
             funding_rates: FeedToggle { enabled: false },
             open_interest: FeedToggle { enabled: false },
+            transactions: Default::default(),
         },
         output: OutputSection {
             dir: "/tmp/test".into(),
@@ -569,6 +571,7 @@ fn kraken_config() -> MarketSnapshotConfig {
             liquidations: FeedToggle { enabled: false },
             funding_rates: FeedToggle { enabled: false },
             open_interest: FeedToggle { enabled: false },
+            transactions: Default::default(),
         },
         output: OutputSection {
             dir: "/tmp/test".into(),

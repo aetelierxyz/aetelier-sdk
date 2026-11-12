@@ -7,11 +7,11 @@ set -euo pipefail
 #
 # Build the image first from the parent of this repository:
 #
-#   docker build -t aetelier-md-worker:v0.1.1 \
+#   docker build -t aetelier-md-worker:v0.1.2 \
 #                -f aetelier-sdk/aetelier-sdk/serve/md_worker.Dockerfile .
 
 WORKER_CONFIG="${1:?usage: $0 <path/to/md_worker_<venue>.toml>}"
-IMAGE="${AETELIER_MD_WORKER_IMAGE:-aetelier-md-worker:v0.1.1}"
+IMAGE="${AETELIER_MD_WORKER_IMAGE:-aetelier-md-worker:v0.1.2}"
 
 if [[ ! -f "$WORKER_CONFIG" ]]; then
   echo "ERROR: config not found: $WORKER_CONFIG" >&2

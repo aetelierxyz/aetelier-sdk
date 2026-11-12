@@ -66,7 +66,7 @@ pub use workers::{
     DataWorkerReport, EventPipeline, FlushReport, GapDetector, GapDetectorSet, GapStats,
     IngestionCore, IngestionReport, MarketWorker, MarketWorkerReport, OutputSink,
     OutputSinkSet, PassthroughPipeline, PublishError, RegistryCounts, SinkState,
-    SinkStatus, SnapshotFlusher, TerminalEventCallback, TerminalSink,
+    SinkStatus, SlotWindow, SnapshotFlusher, TerminalEventCallback, TerminalSink,
     TerminalSinkRawEvent, TopicMessage, TopicPublisher, TopicRegistry, WorkerChannels,
     WorkerCommand, WorkerHandle, WorkerId, WorkerRegistry, WorkerStatus, build_pipeline,
     build_sinks,

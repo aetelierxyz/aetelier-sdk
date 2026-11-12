@@ -5,8 +5,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use aetelier_types::Instrument;
+use aetelier_types::config::markets::market_config::{DeclaredDatatype, DeclaredSet};
 use aetelier_types::exchanges::Exchange;
-use aetelier_types::trading_pair::TradingPair;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -43,6 +44,28 @@ pub enum FeedDatatype {
     Trades,
     FundingRates,
     OpenInterest,
+    Transactions,
+}
+
+impl FeedDatatype {
+    pub const ALL: [FeedDatatype; 5] = [
+        FeedDatatype::Orders,
+        FeedDatatype::Trades,
+        FeedDatatype::FundingRates,
+        FeedDatatype::OpenInterest,
+        FeedDatatype::Transactions,
+    ];
+
+    pub const fn for_declared(declared: DeclaredDatatype) -> Option<FeedDatatype> {
+        match declared {
+            DeclaredDatatype::Orderbook => Some(FeedDatatype::Orders),
+            DeclaredDatatype::Trades => Some(FeedDatatype::Trades),
+            DeclaredDatatype::Liquidations => None,
+            DeclaredDatatype::FundingRates => Some(FeedDatatype::FundingRates),
+            DeclaredDatatype::OpenInterest => Some(FeedDatatype::OpenInterest),
+            DeclaredDatatype::Transactions => Some(FeedDatatype::Transactions),
+        }
+    }
 }
 
 /// `Feed` lifecycle state. `Closed`/`Rejected`/`Failed` are terminal.
@@ -107,7 +130,7 @@ impl FeedState {
 pub struct Feed {
     id: FeedId,
     venue: Exchange,
-    instrument: TradingPair,
+    instrument: Instrument,
     datatype: FeedDatatype,
     state: FeedState,
     /// Set when the drain exceeded its bound: `Closed` with outstanding
@@ -121,11 +144,15 @@ pub struct Feed {
 impl Feed {
     /// Create a Feed for a TaskSpec entry; allocates the `FeedId` and
     /// lands in `Requested`.
-    pub fn new(venue: Exchange, instrument: TradingPair, datatype: FeedDatatype) -> Self {
+    pub fn new(
+        venue: Exchange,
+        instrument: impl Into<Instrument>,
+        datatype: FeedDatatype,
+    ) -> Self {
         Self {
             id: FeedId::new(),
             venue,
-            instrument,
+            instrument: instrument.into(),
             datatype,
             state: FeedState::Requested,
             closed_partial: false,
@@ -139,7 +166,7 @@ impl Feed {
     pub fn venue(&self) -> Exchange {
         self.venue
     }
-    pub fn instrument(&self) -> &TradingPair {
+    pub fn instrument(&self) -> &Instrument {
         &self.instrument
     }
     pub fn datatype(&self) -> FeedDatatype {
@@ -255,6 +282,20 @@ impl FeedSet {
         Self { feeds }
     }
 
+    pub fn for_declared(
+        venue: Exchange,
+        instrument: &Instrument,
+        declared: &DeclaredSet,
+    ) -> Self {
+        Self::new(
+            declared
+                .iter()
+                .filter_map(FeedDatatype::for_declared)
+                .map(|datatype| Feed::new(venue, instrument.clone(), datatype))
+                .collect(),
+        )
+    }
+
     /// Wrap into the shared handle the worker hands to each runtime.
     pub fn into_shared(self) -> SharedFeedSet {
         Arc::new(Mutex::new(self))
@@ -268,16 +309,24 @@ impl FeedSet {
 
     /// Subscribe frames sent for this connection (initial or after reconnect).
     pub fn mark_all_subscribing(&mut self) {
-        self.each_live_mut(|f| f.to_subscribing());
+        self.each_live_mut(|f| {
+            if f.state() != FeedState::Subscribing {
+                f.to_subscribing();
+            }
+        });
     }
 
     /// The shared venue connection dropped; every non-terminal feed waits.
     pub fn mark_all_reconnecting(&mut self) {
-        self.each_live_mut(|f| f.to_reconnecting());
+        self.each_live_mut(|f| {
+            if f.state() != FeedState::Reconnecting {
+                f.to_reconnecting();
+            }
+        });
     }
 
     /// First data for `(instrument, datatype)` — its bound book is live.
-    pub fn mark_live(&mut self, instrument: &TradingPair, datatype: FeedDatatype) {
+    pub fn mark_live(&mut self, instrument: &Instrument, datatype: FeedDatatype) {
         if let Some(f) = self.get_mut(instrument, datatype)
             && !f.state().is_terminal()
             && f.state() != FeedState::Live
@@ -288,7 +337,7 @@ impl FeedSet {
 
     /// No event for `(instrument, datatype)` inside its declared cadence
     /// envelope, while the socket itself stays live.
-    pub fn mark_stale(&mut self, instrument: &TradingPair, datatype: FeedDatatype) {
+    pub fn mark_stale(&mut self, instrument: &Instrument, datatype: FeedDatatype) {
         if let Some(f) = self.get_mut(instrument, datatype)
             && f.state() == FeedState::Live
         {
@@ -299,7 +348,7 @@ impl FeedSet {
     /// The bound book for `(instrument, datatype)` gapped; recovery begins.
     pub fn mark_resubscribing(
         &mut self,
-        instrument: &TradingPair,
+        instrument: &Instrument,
         datatype: FeedDatatype,
     ) {
         if let Some(f) = self.get_mut(instrument, datatype)
@@ -340,7 +389,7 @@ impl FeedSet {
 
     fn get_mut(
         &mut self,
-        instrument: &TradingPair,
+        instrument: &Instrument,
         datatype: FeedDatatype,
     ) -> Option<&mut Feed> {
         self.feeds
@@ -354,7 +403,7 @@ impl FeedSet {
             .iter()
             .map(|f| FeedSnapshot {
                 id: f.id().to_string(),
-                instrument: f.instrument().to_canonical(),
+                instrument: f.instrument().canonical(),
                 datatype: f.datatype(),
                 state: f.state(),
                 partial: f.closed_partial(),
@@ -390,7 +439,7 @@ mod tests {
 
     #[test]
     fn marking_stale_touches_only_the_named_datatype() {
-        let pair = TradingPair::new("BTC", "USDC");
+        let pair = Instrument::from(TradingPair::new("BTC", "USDC"));
         let mut set = FeedSet::new(vec![
             Feed::new(Exchange::Hyperliquid, pair.clone(), FeedDatatype::Orders),
             Feed::new(
@@ -428,7 +477,7 @@ mod tests {
 
     #[test]
     fn a_feed_that_never_reached_live_is_never_marked_stale() {
-        let pair = TradingPair::new("BTC", "USDC");
+        let pair = Instrument::from(TradingPair::new("BTC", "USDC"));
         let mut set = FeedSet::new(vec![Feed::new(
             Exchange::Hyperliquid,
             pair.clone(),
@@ -444,6 +493,8 @@ mod tests {
         );
     }
     use super::*;
+    use aetelier_types::onchain::ChainAddress;
+    use aetelier_types::trading_pair::TradingPair;
 
     #[test]
     fn feed_allocates_id_and_walks_to_live() {
@@ -486,7 +537,7 @@ mod tests {
 
     #[test]
     fn feed_set_walks_the_happy_lifecycle() {
-        let pair = TradingPair::new("BTC", "USDT");
+        let pair = Instrument::from(TradingPair::new("BTC", "USDT"));
         let mut fs = set();
         fs.mark_all_subscribing();
         fs.mark_live(&pair, FeedDatatype::Orders);
@@ -508,7 +559,7 @@ mod tests {
 
     #[test]
     fn terminal_states_absorb_every_marking() {
-        let pair = TradingPair::new("BTC", "USDT");
+        let pair = Instrument::from(TradingPair::new("BTC", "USDT"));
         let mut fs = set();
         fs.mark_all_subscribing();
         fs.mark_all_reconnecting();
@@ -519,6 +570,36 @@ mod tests {
         assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Rejected);
         assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Rejected);
         assert!(!fs.snapshot()[0].partial);
+    }
+
+    #[test]
+    fn set_wide_reconnect_and_subscribe_marks_are_idempotent() {
+        let pair = Instrument::from(TradingPair::new("BTC", "USDT"));
+        let mut fs = set();
+        let ids: Vec<String> = fs.snapshot().into_iter().map(|f| f.id).collect();
+        fs.mark_all_subscribing();
+        fs.mark_all_subscribing();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Subscribing);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Subscribing);
+        fs.mark_live(&pair, FeedDatatype::Orders);
+        fs.mark_all_reconnecting();
+        fs.mark_all_reconnecting();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Reconnecting);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Reconnecting);
+        fs.mark_all_subscribing();
+        fs.mark_all_subscribing();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Subscribing);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Subscribing);
+        fs.mark_live(&pair, FeedDatatype::Trades);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Live);
+        fs.mark_all_reconnecting();
+        fs.mark_all_failed("reconnect budget exhausted");
+        fs.mark_all_reconnecting();
+        fs.mark_all_subscribing();
+        assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Failed);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Failed);
+        let after: Vec<String> = fs.snapshot().into_iter().map(|f| f.id).collect();
+        assert_eq!(after, ids);
     }
 
     #[test]
@@ -599,5 +680,310 @@ mod tests {
         fs.mark_all_closed(true);
         assert_eq!(state_of(&fs, FeedDatatype::Orders), FeedState::Closed);
         assert!(fs.snapshot().iter().all(|f| f.partial));
+    }
+
+    #[test]
+    fn feed_datatype_wire_names_are_the_variant_names() {
+        let wire: Vec<String> = FeedDatatype::ALL
+            .iter()
+            .map(|dt| serde_json::to_string(dt).unwrap())
+            .collect();
+        assert_eq!(
+            wire,
+            [
+                "\"Orders\"",
+                "\"Trades\"",
+                "\"FundingRates\"",
+                "\"OpenInterest\"",
+                "\"Transactions\"",
+            ]
+        );
+        for (dt, json) in FeedDatatype::ALL.into_iter().zip(&wire) {
+            assert_eq!(serde_json::from_str::<FeedDatatype>(json).unwrap(), dt);
+        }
+    }
+
+    #[test]
+    fn declared_datatypes_map_to_feeds_and_liquidations_stay_feedless() {
+        let expected = [
+            (DeclaredDatatype::Orderbook, Some(FeedDatatype::Orders)),
+            (DeclaredDatatype::Trades, Some(FeedDatatype::Trades)),
+            (DeclaredDatatype::Liquidations, None),
+            (
+                DeclaredDatatype::FundingRates,
+                Some(FeedDatatype::FundingRates),
+            ),
+            (
+                DeclaredDatatype::OpenInterest,
+                Some(FeedDatatype::OpenInterest),
+            ),
+            (
+                DeclaredDatatype::Transactions,
+                Some(FeedDatatype::Transactions),
+            ),
+        ];
+        assert_eq!(expected.len(), DeclaredDatatype::ALL.len());
+        for (declared, feed) in expected {
+            assert_eq!(FeedDatatype::for_declared(declared), feed, "{declared:?}");
+        }
+    }
+
+    #[test]
+    fn cex_feed_list_is_unchanged() {
+        use aetelier_types::config::markets::market_config::DataTypesSection;
+        let section: DataTypesSection = toml::from_str(
+            r#"
+[orderbook]
+enabled = true
+
+[trades]
+enabled = true
+
+[liquidations]
+enabled = true
+
+[funding_rates]
+enabled = true
+
+[open_interest]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let feeds: Vec<FeedDatatype> = section
+            .declared_set()
+            .iter()
+            .filter_map(FeedDatatype::for_declared)
+            .collect();
+        assert_eq!(
+            feeds,
+            [
+                FeedDatatype::Orders,
+                FeedDatatype::Trades,
+                FeedDatatype::FundingRates,
+                FeedDatatype::OpenInterest,
+            ]
+        );
+    }
+
+    const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+    const WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+
+    #[test]
+    fn pair_feed_snapshot_keeps_the_canonical_pair_string() {
+        for (venue, base, quote, canonical) in [
+            (Exchange::Binance, "btc", "usdt", "BTC/USDT"),
+            (Exchange::Upbit, "BTC", "KRW", "BTC/KRW"),
+            (Exchange::Hyperliquid, "xyz:tsla", "usdc", "xyz:TSLA/USDC"),
+        ] {
+            let pair = TradingPair::new(base, quote);
+            let snapshot =
+                FeedSet::new(vec![Feed::new(venue, pair.clone(), FeedDatatype::Trades)])
+                    .snapshot();
+            assert_eq!(snapshot[0].instrument, canonical);
+            assert_eq!(snapshot[0].instrument, pair.to_canonical());
+        }
+    }
+
+    #[test]
+    fn feed_set_matches_a_pair_by_canonical_identity_only() {
+        let mut fs = FeedSet::new(vec![Feed::new(
+            Exchange::Binance,
+            TradingPair::new("BTC", "USDT"),
+            FeedDatatype::Trades,
+        )]);
+        fs.mark_all_subscribing();
+        for other in [
+            TradingPair::new("BTCU", "SDT"),
+            TradingPair::new("BTC", "USDC"),
+            TradingPair::new("USDT", "BTC"),
+        ] {
+            let other = Instrument::from(other);
+            fs.mark_live(&other, FeedDatatype::Trades);
+            assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Subscribing);
+        }
+        let same = Instrument::from(TradingPair::new(" btc ", "usdt"));
+        fs.mark_live(&same, FeedDatatype::Orders);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Subscribing);
+        fs.mark_live(&same, FeedDatatype::Trades);
+        assert_eq!(state_of(&fs, FeedDatatype::Trades), FeedState::Live);
+    }
+
+    #[test]
+    fn feed_snapshot_json_shape_is_unchanged_for_pairs() {
+        let pair = Instrument::from(TradingPair::new("BTC", "USDT"));
+        let mut fs = set();
+        fs.mark_all_subscribing();
+        fs.mark_live(&pair, FeedDatatype::Orders);
+        let snapshot = fs.snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"[{{"id":"{}","instrument":"BTC/USDT","datatype":"Orders","state":"Live","partial":false,"reason":null}},{{"id":"{}","instrument":"BTC/USDT","datatype":"Trades","state":"Subscribing","partial":false,"reason":null}}]"#,
+                snapshot[0].id, snapshot[1].id
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<FeedSnapshot>>(&json).unwrap(),
+            snapshot
+        );
+
+        fs.mark_all_reconnecting();
+        fs.mark_all_rejected("venue refused");
+        let rejected = serde_json::to_value(&fs.snapshot()[0]).unwrap();
+        assert_eq!(
+            rejected,
+            serde_json::json!({
+                "id": snapshot[0].id,
+                "instrument": "BTC/USDT",
+                "datatype": "Orders",
+                "state": "Rejected",
+                "partial": false,
+                "reason": "venue refused",
+            })
+        );
+    }
+
+    #[test]
+    fn pair_and_address_feeds_are_keyed_by_instrument() {
+        let pair = Instrument::from(TradingPair::new("SOL", "USDC"));
+        let jupiter = Instrument::from(ChainAddress::solana(JUPITER_V6).unwrap());
+        let whirlpool = Instrument::from(ChainAddress::solana(WHIRLPOOL).unwrap());
+        let mut fs = FeedSet::new(vec![
+            Feed::new(Exchange::Hyperliquid, pair.clone(), FeedDatatype::Trades),
+            Feed::new(
+                Exchange::Solana,
+                jupiter.clone(),
+                FeedDatatype::Transactions,
+            ),
+            Feed::new(
+                Exchange::Solana,
+                whirlpool.clone(),
+                FeedDatatype::Transactions,
+            ),
+        ]);
+        fs.mark_all_subscribing();
+        fs.mark_live(&jupiter, FeedDatatype::Trades);
+        fs.mark_live(&pair, FeedDatatype::Transactions);
+        fs.mark_live(&jupiter, FeedDatatype::Transactions);
+        fs.mark_live(&pair, FeedDatatype::Trades);
+        fs.mark_stale(&pair, FeedDatatype::Trades);
+        let states: Vec<(String, FeedState)> = fs
+            .snapshot()
+            .into_iter()
+            .map(|f| (f.instrument, f.state))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("SOL/USDC".to_string(), FeedState::Stale),
+                (JUPITER_V6.to_string(), FeedState::Live),
+                (WHIRLPOOL.to_string(), FeedState::Subscribing),
+            ]
+        );
+    }
+
+    #[test]
+    fn feed_new_accepts_a_trading_pair() {
+        let pair = TradingPair::new("ETH", "USDT");
+        let from_pair = Feed::new(Exchange::Okx, pair.clone(), FeedDatatype::Trades);
+        let from_instrument = Feed::new(
+            Exchange::Okx,
+            Instrument::Pair(pair.clone()),
+            FeedDatatype::Trades,
+        );
+        assert_eq!(from_pair.instrument(), from_instrument.instrument());
+        assert_eq!(from_pair.instrument().as_pair(), Some(&pair));
+        assert_ne!(from_pair.id(), from_instrument.id());
+    }
+
+    #[test]
+    fn feed_datatype_all_holds_each_variant_once() {
+        let position = |datatype: FeedDatatype| match datatype {
+            FeedDatatype::Orders => 0,
+            FeedDatatype::Trades => 1,
+            FeedDatatype::FundingRates => 2,
+            FeedDatatype::OpenInterest => 3,
+            FeedDatatype::Transactions => 4,
+        };
+        for (index, datatype) in FeedDatatype::ALL.into_iter().enumerate() {
+            assert_eq!(position(datatype), index, "{datatype:?}");
+        }
+    }
+
+    #[test]
+    fn a_cex_feed_set_follows_the_declared_order() {
+        use aetelier_types::config::markets::market_config::DataTypesSection;
+        let section: DataTypesSection = toml::from_str(
+            r#"
+[open_interest]
+enabled = true
+
+[liquidations]
+enabled = true
+
+[trades]
+enabled = true
+
+[funding_rates]
+enabled = true
+
+[orderbook]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let pair = Instrument::from(TradingPair::new("BTC", "USDT"));
+        let snapshot =
+            FeedSet::for_declared(Exchange::Bybit, &pair, &section.declared_set())
+                .snapshot();
+        let datatypes: Vec<FeedDatatype> = snapshot.iter().map(|f| f.datatype).collect();
+        assert_eq!(
+            datatypes,
+            [
+                FeedDatatype::Orders,
+                FeedDatatype::Trades,
+                FeedDatatype::FundingRates,
+                FeedDatatype::OpenInterest,
+            ]
+        );
+        let by_name: Vec<FeedDatatype> = section
+            .enabled_names()
+            .iter()
+            .filter_map(|name| {
+                DeclaredDatatype::ALL.into_iter().find(|dt| dt.id() == name)
+            })
+            .filter_map(FeedDatatype::for_declared)
+            .collect();
+        assert_eq!(datatypes, by_name);
+        assert!(
+            snapshot
+                .iter()
+                .all(|f| f.instrument == "BTC/USDT" && f.state == FeedState::Requested)
+        );
+    }
+
+    #[test]
+    fn a_transactions_feed_is_built_for_an_address() {
+        let address = Instrument::from(ChainAddress::solana(JUPITER_V6).unwrap());
+        let fs = FeedSet::for_declared(
+            Exchange::Solana,
+            &address,
+            &DeclaredSet::only(DeclaredDatatype::Transactions),
+        );
+        assert_eq!(fs.feeds.len(), 1);
+        assert_eq!(fs.feeds[0].venue(), Exchange::Solana);
+        assert_eq!(fs.feeds[0].instrument(), &address);
+        let snapshot = fs.snapshot();
+        assert_eq!(snapshot[0].datatype, FeedDatatype::Transactions);
+        assert_eq!(snapshot[0].instrument, JUPITER_V6);
+        assert_eq!(snapshot[0].state, FeedState::Requested);
+        let feedless = FeedSet::for_declared(
+            Exchange::Solana,
+            &address,
+            &DeclaredSet::only(DeclaredDatatype::Liquidations),
+        );
+        assert!(feedless.snapshot().is_empty());
     }
 }

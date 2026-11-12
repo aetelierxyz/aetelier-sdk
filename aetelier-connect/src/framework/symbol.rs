@@ -1,6 +1,8 @@
 //! Venue-agnostic symbol codec: encodes and decodes trading pairs to and
 //! from each venue's wire spelling, selected per venue by the registry.
 
+use aetelier_types::Instrument;
+use aetelier_types::onchain::{Chain, ChainAddress};
 use aetelier_types::trading_pair::TradingPair;
 
 /// How a venue spells a trading pair on the wire.
@@ -25,6 +27,9 @@ pub enum SymbolCodec {
     BareCoin {
         quote: &'static str,
     },
+    ChainAddress {
+        chain: Chain,
+    },
 }
 
 impl SymbolCodec {
@@ -38,6 +43,7 @@ impl SymbolCodec {
             SymbolCodec::Underscore { upper } => Self::case(format!("{b}_{q}"), *upper),
             SymbolCodec::QuoteFirst { sep } => format!("{q}{sep}{b}"),
             SymbolCodec::BareCoin { .. } => b.to_string(),
+            SymbolCodec::ChainAddress { .. } => pair.to_canonical(),
         }
     }
 
@@ -74,8 +80,23 @@ impl SymbolCodec {
                 }
                 (up.as_str(), *quote)
             }
+            SymbolCodec::ChainAddress { .. } => return None,
         };
         Some(TradingPair::new(base, quote))
+    }
+
+    pub fn decode_instrument(&self, raw: &str) -> Option<Instrument> {
+        match self {
+            SymbolCodec::ChainAddress { chain } => ChainAddress::parse(*chain, raw)
+                .ok()
+                .map(Instrument::Address),
+            SymbolCodec::Concat { .. }
+            | SymbolCodec::Hyphen
+            | SymbolCodec::Slash
+            | SymbolCodec::Underscore { .. }
+            | SymbolCodec::QuoteFirst { .. }
+            | SymbolCodec::BareCoin { .. } => self.decode(raw).map(Instrument::Pair),
+        }
     }
 
     fn case(s: String, upper: bool) -> String {
@@ -167,6 +188,61 @@ mod tests {
         for raw in ["para:STX", "mkts:US500", "hyna:1000PEPE", "km:UNITREE"] {
             let p = codec.decode(raw).expect(raw);
             assert_eq!(codec.encode(&p), raw);
+        }
+    }
+
+    const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+
+    #[test]
+    fn chain_address_codec_is_case_exact_and_never_yields_a_pair() {
+        let codec = SymbolCodec::ChainAddress {
+            chain: Chain::Solana,
+        };
+        let instrument = codec.decode_instrument(JUPITER_V6).unwrap();
+        assert!(matches!(instrument, Instrument::Address(_)));
+        assert_eq!(instrument.to_string(), JUPITER_V6);
+        assert_eq!(codec.decode(JUPITER_V6), None);
+        for raw in [
+            JUPITER_V6.to_lowercase(),
+            format!(" {JUPITER_V6}"),
+            "SOL/USDC".to_string(),
+        ] {
+            assert_eq!(codec.decode_instrument(&raw), None, "{raw:?}");
+            assert_eq!(codec.decode(&raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn decode_instrument_equals_decode_for_every_pair_codec() {
+        let registry = crate::framework::registry::registry();
+        let entrepot = SymbolCodec::BareCoin { quote: "USDC" };
+        let venues = [
+            ("binance", "BTCUSDT"),
+            ("bybit", "BTCUSDT"),
+            ("bitget", "BTCUSDT"),
+            ("htx", "btcusdt"),
+            ("coinbase", "BTC-USD"),
+            ("okx", "BTC-USDT"),
+            ("kucoin", "BTC-USDT"),
+            ("kraken", "BTC/USD"),
+            ("gateio", "BTC_USDT"),
+            ("poloniex", "BTC_USDT"),
+            ("bitso", "btc_mxn"),
+            ("upbit", "KRW-BTC"),
+            ("hyperliquid", "BTC"),
+        ];
+        let cases = venues
+            .into_iter()
+            .map(|(venue, raw)| (venue, &registry[venue].profile().symbol_codec, raw))
+            .chain([("entrepot", &entrepot, "ETH")]);
+        for (venue, codec, raw) in cases {
+            let pair = codec.decode(raw);
+            assert!(pair.is_some(), "{venue} must decode {raw:?}");
+            assert_eq!(
+                codec.decode_instrument(raw),
+                pair.map(Instrument::Pair),
+                "{venue}"
+            );
         }
     }
 }

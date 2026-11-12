@@ -7,6 +7,7 @@
 use crate::{
     funding::{FundingRate, FundingSettlement},
     liquidations::Liquidation,
+    onchain::Transaction,
     open_interest::OpenInterest,
     orderbooks::{Orderbook, decimal_to_f64},
     trades::Trade,
@@ -41,6 +42,9 @@ pub struct MarketSnapshot {
 
     #[serde(default)]
     pub funding_settlements: Vec<FundingSettlement>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transactions: Vec<Transaction>,
 }
 
 impl MarketSnapshot {
@@ -54,6 +58,7 @@ impl MarketSnapshot {
             funding_rate: Vec::new(),
             open_interest: Vec::new(),
             funding_settlements: Vec::new(),
+            transactions: Vec::new(),
         }
     }
 
@@ -65,6 +70,7 @@ impl MarketSnapshot {
             || !self.funding_rate.is_empty()
             || !self.open_interest.is_empty()
             || !self.funding_settlements.is_empty()
+            || !self.transactions.is_empty()
     }
 
     /// Total trade volume (sum of amounts) in this period.

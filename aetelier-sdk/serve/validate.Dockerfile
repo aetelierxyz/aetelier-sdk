@@ -7,14 +7,14 @@
 # can compute deltas across runs.
 #
 # Build context: the parent of this repository
-#   docker build -t aetelier-validate:v0.1.1 \
+#   docker build -t aetelier-validate:v0.1.2 \
 #                -f aetelier-sdk/aetelier-sdk/serve/validate.Dockerfile .
 #
 # Run on demand:
 #   docker run --rm \
 #     -v /var/lib/aetelier/datasets:/data:ro \
 #     -v /var/lib/aetelier/validate-state:/state \
-#     aetelier-validate:v0.1.1 \
+#     aetelier-validate:v0.1.2 \
 #     --flush-threshold 3600 --grid-period-us 100000 --verbose
 #
 # Notes
@@ -22,7 +22,7 @@
 # * `/data` is mounted read-only — the validator never mutates the lake.
 # * `/state` is read-write and holds `validate_state.json` (cumulative)
 #   plus `last_report.json` (per-run snapshot).
-# * Exit code 0 = all 10 tests passed, 1 = at least one failed,
+# * Exit code 0 = all 13 tests passed, 1 = at least one failed,
 #   2 = fatal error (state file unreadable, etc.). Wire this directly
 #   into a cron-driven monitor or alertmanager probe.
 

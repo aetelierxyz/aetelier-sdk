@@ -1,6 +1,6 @@
 # md_worker.Dockerfile
 #
-# Standalone market-data collector for v0.1.1 deployment.
+# Standalone market-data collector for v0.1.2 deployment.
 # Builds the aetelier-sdk `md_worker` binary; runs with a TOML manifest
 # mounted at /configs/manifest.toml, writes parquet to /data.
 #
@@ -12,7 +12,7 @@
 # `aetelier-connect::workers::output::build_sinks`.
 #
 # Build context: the parent of this repository
-#   docker build -t aetelier-md-worker:v0.1.1 \
+#   docker build -t aetelier-md-worker:v0.1.2 \
 #                -f aetelier-sdk/aetelier-sdk/serve/md_worker.Dockerfile .
 
 # ── Stage 1: builder ──────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ RUN mkdir -p aetelier-sdk/aetelier-sdk/src \
     && echo 'fn main(){}' > aetelier-sdk/aetelier-sdk/src/bin/md_worker.rs
 
 RUN cd aetelier-sdk && cargo build --release \
-        -p aetelier-sdk --bin md_worker --features parquet 2>/dev/null || true
+        -p aetelier-sdk --bin md_worker --features parquet,grpc 2>/dev/null || true
 
 # Real source.
 COPY aetelier-sdk/    aetelier-sdk/
@@ -61,7 +61,7 @@ RUN find aetelier-sdk -type f \
         \( -name "*.rs" -o -name "Cargo.toml" \) -exec touch {} +
 
 RUN cd aetelier-sdk && cargo build --release \
-        -p aetelier-sdk --bin md_worker --features parquet \
+        -p aetelier-sdk --bin md_worker --features parquet,grpc \
     && strip target/release/md_worker
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────

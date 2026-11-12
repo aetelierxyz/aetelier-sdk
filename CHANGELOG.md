@@ -8,6 +8,73 @@ entry is edited only to correct a factual error, never to restate its scope.
 
 ### Promotions
 
+## v0.1.2 — 2026-11-12
+
+### Promotions
+
+- 2026-11-12 · `feature/onchain-solana` (#30) — the `solana` venue over Yellowstone gRPC (feature `grpc`): `transactions.v1` Parquet, the slot clock, slot heartbeats on quiet windows; `md_worker` exits `78` when every worker is rejected.
+
+### Added
+
+- `aetelier_types::onchain`: `Chain`, `ChainAddress` (case-preserving base58, validated to 32 bytes), `Instrument`, and the `Transaction` record with `MatchRole`, `Commitment`, `TransactionVersion` (`legacy`, `v0`, `v1`) and `TransactionFailure`. `DeclaredDatatype::Transactions`, the `[datatypes.transactions]` feed (`enabled`, `match`, `include_failed`, `logs`) and `MarketSnapshot.transactions`.
+- `aetelier_io::onchain`: the `transactions.v1` Parquet writer and reader (file tag `txs`, leaf `transactions`), its schema fingerprint, and `check_transactions`.
+- `validate` T11–T13: unique `(address, signature)` per file, `(slot, tx_index)` order per address, block context and row invariants. T01 expects `transactions` for `solana` and `orderbooks` + `trades` elsewhere.
+- `Exchange::Solana` (`solana`, no alias) and `MarketType::Onchain` (`onchain`); `Exchange::chain()` names a venue's chain. `Instrument` serializes as `BASE/QUOTE` or bare base58 and parses by the slash; `Instrument::from_exchange_symbol` decodes per venue.
+- `SymbolCodec::ChainAddress` and `SymbolCodec::decode_instrument`; `FeedDatatype::Transactions` with `FeedDatatype::ALL` and `FeedDatatype::for_declared`.
+- `SyncMode::OnSlot` (`on_slot`) and `ClockMode::SlotDriven` (label `ON_SLOT`); `SyncMode::clock_mode`, `WorkerStatus::initial` and `IngestionCore::exchange`.
+- `transport = "grpc"` with a strict `[collect.grpc]` section (`GrpcSection`: endpoint, token env, commitment, filter and size limits).
+- Admission: `ExchangeAdapter::supported_market_types`, `ExchangeAdapter::default_emission_delay_us`, `admit_market_type`, `admit_datatypes`, `admit_registered`, `MarketWorkerConfig::admit` and `MarketWorkerManifest::resolve_admitted`.
+- `FeedSet::for_declared`.
+- `SourceMetricsSnapshot` counters `filtered_out`, `slot_gaps`, `blocks_lost`, `late_txs`, `partial_banks_discarded`, `abandoned_banks`, `fanout_overflow`, `votes_excluded`, `tx_error_decode_failures` and the gauge `behind_tip_slots`, zero on CEX venues.
+- Gap ledger cause `slot_gap` with `prev_slot`, `prev_height`, `next_slot`, `next_height` and `blocks_lost`, omitted from lines of other causes.
+- Conformance kind `feed_lifecycle` on every venue.
+- `aetelier_connect::framework::slotbook`: `SourcedSlotbook` assembles transactions per `(slot, bank_id)`, seals each bank on its block meta, releases banks in block-height order with a bounded reorder hold, opens coverage after each subscribe, and reports `SlotGap`, `SlotTick` and loss counters.
+- `aetelier_connect::framework::onchain`: decoded transaction input, address roles, the watched-address predicate, requested compute (ComputeBudget payloads read by their leading bytes, as the runtime reads them), `failure_*` derivation and `transaction_rows` for `transactions.v1`.
+- `aetelier_types::onchain::encode_base58`.
+- `ReconstructionModel::Stream` (book level `none`; no books, no seeding).
+- `DomainEvent` and `ReconstructedEvent` `Transaction`, `SlotTick`, `SlotGap`, `ConnectionLost`, `ConnectionResumed`; a slot gap is counted (`slot_gaps`, `blocks_lost`) and written to the gap ledger, never resynced.
+- `MarketSynchronizer::slot_driven`, `on_transaction` and `on_slot_tick`: a chain-time grid whose emission hold-back is measured in chain time.
+- `GapIncident::from_slot_gap`, `ExchangeAdapter::replay_stream` and `ReplayFrame`.
+- `aetelier_io::onchain::read_transaction_keys` and `LeafKeys`.
+- Cargo feature `grpc` in `aetelier-connect` and `aetelier-sdk`, off by default: `yellowstone-grpc-client` 17 and `yellowstone-grpc-proto` 14.0.1, with `TransactionError` decoded through `wincode`.
+- `framework::grpc`: the full Yellowstone subscribe request (one transaction filter over every watched address, `blocks_meta`, explicit commitment, never `from_slot`) and ping-only requests, checked against `account_include_max` and `account_include_reject`; `classify_status` with retryable, rate-limited, terminal and rejected-update outcomes, terminal statuses staying terminal after data; `SubscribeUpdate` decoding into the on-chain transaction input and slot-book block meta, keeping undecodable error bytes.
+- `framework::grpc::GrpcSession`: one Yellowstone subscription opened with its full request first, each subscribe and filter update acknowledged by a ping, server pings answered, client pings on `ping_interval_secs` for the round trip, a 30 s `blocks_meta` staleness bound and per-connection receipt stamps; `GrpcSettings` (TLS with native roots, x-token, zstd, decode limit, HTTP/2 keepalive) and the `GeyserDial` connect seam with `NetworkDial`.
+- `framework::grpc::GrpcConnections`: gRPC workers attach to one Yellowstone subscription per endpoint, commitment, token variable and shard; the connection owns reconnect at tip, backoff, a connect-attempt limit and the rate-limit cool-down, keeps its slot book across reconnects, covers each attach from the second bank after its acknowledgement whatever slots were skipped, fans out per attach through bounded queues, and reports each outage to every attach as `ConnectionLost`, `ConnectionResumed` and one exact `SlotGap`. After its last detach, a connection's reconnect deadline and connect attempts hold the next connection with the same key until that deadline passes.
+- `GrpcAttach`, `drive_grpc` and `SourceMetrics::set_conn_epoch_us`.
+- The `solana` venue under feature `grpc`: market type `onchain`, datatype `transactions`, `production` and `testnet`, a 2 s chain-time emission delay, live workers attached through `framework::grpc::GrpcConnections`, and `replay_stream` over captured `SubscribeUpdate` frames.
+- `MarketWorker::with_grpc_connections`.
+- Example `capture_grpc` (feature `grpc`): raw Yellowstone `SubscribeUpdate` bytes as base64 JSON lines with receipt times and reconnect markers.
+- Provenance in `datasets/README.md` for eight whole-slot windows of raw `SubscribeUpdate` bytes, covering finalized and confirmed, filtered and unfiltered, a quiet address and a resubscribe at tip. The captures are not distributed; they are read from `aetelier-connect/datasets/solana/`, which git ignores.
+- The `solana` conformance suite under feature `grpc`, on those captures (`done: true`; its stream kinds report not applicable when the captures are absent): kinds `tx_decode_surface`, `slot_assembly`, `slot_reorder`, `tx_dedup`, `slot_gap_detection`, `slot_tick_grid`, `shared_connection_fanout`, `address_match_roles`, `failed_inclusion` and `tx_invariants`, not applicable on the 13 CEX venues.
+- Atlas ids `DAT-TX-INV-1` to `DAT-TX-INV-4`, `DAT-SB-INV-1`, `DAT-SB-INV-2`, `DAT-SB-T-1`, `DAT-SB-T-2` and `DAT-SY-INV-25` in `framework::atlas::ENFORCED` under feature `grpc`.
+- `index.jsonl` heartbeat lines on `transactions` leaves: a flush window with no transaction rows appends `{"heartbeat":true,"symbol","rows":0,"t_min_us","t_max_us","last_slot","last_block_height","schema_id":"transactions.v1"}` to the leaf of the UTC day of `t_max_us`, creating the leaf when absent; `last_slot` and `last_block_height` come from the newest `SlotTick` at or before `t_max_us`, `null` when none was seen. CEX leaves never get one.
+- `aetelier_io::leaf_index`: `HeartbeatEntry`, `LeafIndex`, `read_leaf_index` and `append_heartbeat`; `OutputSink::emit_slot_tick`, `OutputSinkSet::emit_slot_tick`, `SnapshotFlusher::flush_slot_window`, `SlotWindow` and `MarketWorkerReport.feeds`.
+
+### Changed
+
+- `WorkerStatus.pair` is an `Instrument`; CEX status JSON is unchanged.
+- `md_worker` admits every worker before starting any.
+- `MarketWorker` refuses `transport = "grpc"`, `sync_mode = "on_slot"`, `market_type = "onchain"` and `[collect.datatypes.transactions]` on CEX venues. A `solana` worker needs `transport = "grpc"`, a valid `[collect.grpc]`, a `[collect.reconnect]`, when present, with `jitter_factor` from 0 to 1, a nonzero `initial_delay_ms` when jittered and `initial_delay_ms` at most `max_delay_ms`, a base58 address, `sync_mode = "on_slot"`, no enabled `[collect.reconcile]` and a declared datatype, and fails naming the `grpc` feature while no solana adapter is built in.
+- `DataWorker` refuses chain venues, `market_type = "onchain"` and `[collect.datatypes.transactions]`.
+- `[collect.datatypes.transactions]` rejects unknown keys; a manifest with a chain venue rejects duplicate addresses and unread keys under `[collect.sync]` and `[[workers]]`.
+- `Feed`, `FeedSet` and `SourceRuntime` liveness are keyed by `Instrument`; `Feed::new` takes any `Into<Instrument>`; feed snapshots keep the `BASE/QUOTE` string.
+- `FeedSet::mark_all_reconnecting` and `mark_all_subscribing` leave feeds already in the target state unchanged.
+- `validate` walks `<exchange>/<market_type>/<datatype>/<binding_id>/<YYYY-MM-DD>/` leaves as well as `<exchange>/<datatype>/`, takes a leaf's files from its `index.jsonl` when present, and counts pending files and torn index lines. T11 checks `(address, signature)` across the files of a leaf day.
+- CI runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in the gate and portability jobs, audits that dependency graph with `cargo deny`, and runs `cargo check --all-features`.
+- `md_worker` installs the rustls `ring` provider as the process default before it builds any worker.
+- A `transport = "grpc"` worker ends only on a terminal rejection (feeds `Rejected`, state `Disconnected`), a stop or a shutdown; outages reach it as connection-state events and slot gaps, never as a wall-clock gap incident. A stop, restart or shutdown inside a bank finishes that bank within the stop drain bound; a bank it cannot finish, or one cut by a pause, closes the feeds `partial`.
+- `md_worker` starts `transport = "grpc"` workers without the 250 ms startup stagger.
+- `md_worker` with `RUST_LOG` unset logs at `info` with the `rustls` targets off; an explicit `RUST_LOG` is used as given.
+- The release workflow runs clippy and nextest with `aetelier-sdk/parquet,aetelier-sdk/grpc` in its gates and builds the released `md_worker`, `validate` and `rehydrate` binaries with `--features parquet,grpc`; `md_worker.Dockerfile` builds `md_worker` with `--features parquet,grpc`.
+- `VenueConformance` gains `expect_instrument` and `stream_fixtures`, with a loader for `{"t_us","upd"}` and `{"t_us","reconnect":true}` lines; `symbol_canonicalization` checks `decode_instrument`, `feed_lifecycle` replays stream venues through `replay_stream`, and `datatype_isolation` is not applicable on single-datatype venues.
+- A line with `"heartbeat": true` in `index.jsonl` is a heartbeat, never a file and never torn; `read_index` and `pending_files` skip it. `validate` reports `heartbeats`, counts them toward T01 and skips them in T10 and the file checks.
+- `md_worker` exits `78` when every worker ended `Rejected` after a terminal gRPC rejection, logging each reason first; a stop or shutdown still exits `0` and a startup error `1`.
+
+### Fixed
+
+- Workers flushing into the same leaf in one process could delete each other's staged Parquet file in the `.staging` sweep, failing the flush with `ENOENT` and forcing a retry. Flushes into one leaf are now serialized in-process.
+- A file left unlisted by a crashed flush is reported as pending instead of validated, so it no longer overlaps its retried sibling in T10.
+
 ## v0.1.1 — 2026-10-06
 
 ### Promotions

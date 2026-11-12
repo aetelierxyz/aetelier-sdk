@@ -3,6 +3,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::onchain::Chain;
+
 #[cfg(feature = "wasm")]
 use tsify_next::Tsify;
 #[cfg(feature = "wasm")]
@@ -23,6 +25,7 @@ pub enum MarketType {
     Perpetual,
     /// Coin-margined inverse perpetual or fixed-maturity contracts.
     Inverse,
+    Onchain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -51,6 +54,7 @@ impl fmt::Display for MarketType {
             MarketType::Spot => write!(f, "spot"),
             MarketType::Perpetual => write!(f, "perpetual"),
             MarketType::Inverse => write!(f, "inverse"),
+            MarketType::Onchain => write!(f, "onchain"),
         }
     }
 }
@@ -63,6 +67,7 @@ impl MarketType {
             "spot" => Some(MarketType::Spot),
             "perpetual" | "perp" | "linear" => Some(MarketType::Perpetual),
             "inverse" | "coin" => Some(MarketType::Inverse),
+            "onchain" => Some(MarketType::Onchain),
             _ => None,
         }
     }
@@ -112,6 +117,7 @@ pub enum Exchange {
     /// Bitso (LatAm) spot exchange — underscore lowercase symbols (`btc_mxn`).
     Bitso,
     Hyperliquid,
+    Solana,
 }
 
 impl fmt::Display for Exchange {
@@ -130,6 +136,7 @@ impl fmt::Display for Exchange {
             Exchange::Bitget => write!(f, "bitget"),
             Exchange::Bitso => write!(f, "bitso"),
             Exchange::Hyperliquid => write!(f, "hyperliquid"),
+            Exchange::Solana => write!(f, "solana"),
         }
     }
 }
@@ -137,7 +144,7 @@ impl fmt::Display for Exchange {
 impl Exchange {
     /// Every supported exchange, in declaration order. The authoritative,
     /// compile-time-exhaustive list of venues the SDK can collect from.
-    pub const fn all() -> [Exchange; 13] {
+    pub const fn all() -> [Exchange; 14] {
         [
             Exchange::Bybit,
             Exchange::Coinbase,
@@ -152,7 +159,27 @@ impl Exchange {
             Exchange::Bitget,
             Exchange::Bitso,
             Exchange::Hyperliquid,
+            Exchange::Solana,
         ]
+    }
+
+    pub const fn chain(self) -> Option<Chain> {
+        match self {
+            Exchange::Bybit
+            | Exchange::Coinbase
+            | Exchange::Kraken
+            | Exchange::Binance
+            | Exchange::Okx
+            | Exchange::Gateio
+            | Exchange::Upbit
+            | Exchange::Poloniex
+            | Exchange::Htx
+            | Exchange::Kucoin
+            | Exchange::Bitget
+            | Exchange::Bitso
+            | Exchange::Hyperliquid => None,
+            Exchange::Solana => Some(Chain::Solana),
+        }
     }
 
     /// Attempt to parse an exchange from a loose string, returning `None`
@@ -172,6 +199,7 @@ impl Exchange {
             "bitget" => Some(Exchange::Bitget),
             "bitso" => Some(Exchange::Bitso),
             "hyperliquid" => Some(Exchange::Hyperliquid),
+            "solana" => Some(Exchange::Solana),
             _ => None,
         }
     }
@@ -189,7 +217,7 @@ impl FromStr for Exchange {
 mod tests {
     use super::*;
 
-    const ALL: [(&str, Exchange); 13] = [
+    const ALL: [(&str, Exchange); 14] = [
         ("bybit", Exchange::Bybit),
         ("coinbase", Exchange::Coinbase),
         ("kraken", Exchange::Kraken),
@@ -203,6 +231,7 @@ mod tests {
         ("bitget", Exchange::Bitget),
         ("bitso", Exchange::Bitso),
         ("hyperliquid", Exchange::Hyperliquid),
+        ("solana", Exchange::Solana),
     ];
 
     #[test]
@@ -230,6 +259,7 @@ mod tests {
         assert_eq!(Exchange::from_str_loose("gate"), Some(Exchange::Gateio));
         assert_eq!(Exchange::from_str_loose("UPBIT"), Some(Exchange::Upbit));
         assert_eq!(Exchange::from_str_loose("nope"), None);
+        assert_eq!(Exchange::from_str_loose("sol"), None);
     }
 
     #[test]
@@ -238,5 +268,32 @@ mod tests {
         assert_eq!(json, "\"kucoin\"");
         let back: Exchange = serde_json::from_str("\"bitso\"").unwrap();
         assert_eq!(back, Exchange::Bitso);
+    }
+
+    #[test]
+    fn chain_is_set_only_for_solana() {
+        for (name, ex) in ALL {
+            let expected = (ex == Exchange::Solana).then_some(Chain::Solana);
+            assert_eq!(ex.chain(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn onchain_market_type_round_trips_and_spot_stays_default() {
+        assert_eq!(MarketType::Onchain.to_string(), "onchain");
+        assert_eq!(
+            MarketType::from_str_loose("onchain"),
+            Some(MarketType::Onchain)
+        );
+        assert_eq!(
+            MarketType::from_str_loose("ONCHAIN"),
+            Some(MarketType::Onchain)
+        );
+        assert_eq!("onchain".parse::<MarketType>(), Ok(MarketType::Onchain));
+        let json = serde_json::to_string(&MarketType::Onchain).unwrap();
+        assert_eq!(json, "\"onchain\"");
+        let back: MarketType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MarketType::Onchain);
+        assert_eq!(MarketType::default(), MarketType::Spot);
     }
 }

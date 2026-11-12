@@ -94,6 +94,16 @@ struct SourceMetricsInner {
     ver_rejected: AtomicU64,
     integrity_fail: AtomicU64,
     republished: AtomicU64,
+    filtered_out: AtomicU64,
+    slot_gaps: AtomicU64,
+    blocks_lost: AtomicU64,
+    late_txs: AtomicU64,
+    partial_banks_discarded: AtomicU64,
+    abandoned_banks: AtomicU64,
+    fanout_overflow: AtomicU64,
+    votes_excluded: AtomicU64,
+    tx_error_decode_failures: AtomicU64,
+    behind_tip_slots: AtomicU64,
 }
 
 /// Confidence class of the trade-loss accounting on this source, encoded as a
@@ -203,6 +213,26 @@ pub struct SourceMetricsSnapshot {
     pub integrity_fail: u64,
     #[serde(default)]
     pub republished: u64,
+    #[serde(default)]
+    pub filtered_out: u64,
+    #[serde(default)]
+    pub slot_gaps: u64,
+    #[serde(default)]
+    pub blocks_lost: u64,
+    #[serde(default)]
+    pub late_txs: u64,
+    #[serde(default)]
+    pub partial_banks_discarded: u64,
+    #[serde(default)]
+    pub abandoned_banks: u64,
+    #[serde(default)]
+    pub fanout_overflow: u64,
+    #[serde(default)]
+    pub votes_excluded: u64,
+    #[serde(default)]
+    pub tx_error_decode_failures: u64,
+    #[serde(default)]
+    pub behind_tip_slots: u64,
 }
 
 impl SourceMetrics {
@@ -240,6 +270,12 @@ impl SourceMetrics {
     /// the first connect completes.
     pub fn conn_epoch_us(&self) -> u64 {
         self.inner.conn_epoch_us.load(Ordering::Relaxed)
+    }
+
+    pub fn set_conn_epoch_us(&self, conn_epoch_us: u64) {
+        self.inner
+            .conn_epoch_us
+            .fetch_max(conn_epoch_us, Ordering::AcqRel);
     }
 
     /// One decoded wire frame reached the normalizer.
@@ -310,6 +346,52 @@ impl SourceMetrics {
 
     pub fn bump_republished(&self) {
         self.inner.republished.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn bump_filtered_out(&self) {
+        self.inner.filtered_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn bump_slot_gaps(&self) {
+        self.inner.slot_gaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_blocks_lost(&self, blocks: u64) {
+        self.inner.blocks_lost.fetch_add(blocks, Ordering::Relaxed);
+    }
+
+    pub fn add_late_txs(&self, txs: u64) {
+        self.inner.late_txs.fetch_add(txs, Ordering::Relaxed);
+    }
+
+    pub fn add_partial_banks_discarded(&self, banks: u64) {
+        self.inner
+            .partial_banks_discarded
+            .fetch_add(banks, Ordering::Relaxed);
+    }
+
+    pub fn add_abandoned_banks(&self, banks: u64) {
+        self.inner
+            .abandoned_banks
+            .fetch_add(banks, Ordering::Relaxed);
+    }
+
+    pub fn bump_fanout_overflow(&self) {
+        self.inner.fanout_overflow.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn bump_votes_excluded(&self) {
+        self.inner.votes_excluded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn bump_tx_error_decode_failures(&self) {
+        self.inner
+            .tx_error_decode_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_behind_tip_slots(&self, slots: u64) {
+        self.inner.behind_tip_slots.store(slots, Ordering::Relaxed);
     }
 
     /// One trade-continuity break was observed on a venue trade sequence.
@@ -428,6 +510,16 @@ impl SourceMetrics {
             ver_rejected: i.ver_rejected.load(Ordering::Relaxed),
             integrity_fail: i.integrity_fail.load(Ordering::Relaxed),
             republished: i.republished.load(Ordering::Relaxed),
+            filtered_out: i.filtered_out.load(Ordering::Relaxed),
+            slot_gaps: i.slot_gaps.load(Ordering::Relaxed),
+            blocks_lost: i.blocks_lost.load(Ordering::Relaxed),
+            late_txs: i.late_txs.load(Ordering::Relaxed),
+            partial_banks_discarded: i.partial_banks_discarded.load(Ordering::Relaxed),
+            abandoned_banks: i.abandoned_banks.load(Ordering::Relaxed),
+            fanout_overflow: i.fanout_overflow.load(Ordering::Relaxed),
+            votes_excluded: i.votes_excluded.load(Ordering::Relaxed),
+            tx_error_decode_failures: i.tx_error_decode_failures.load(Ordering::Relaxed),
+            behind_tip_slots: i.behind_tip_slots.load(Ordering::Relaxed),
         }
     }
 }
@@ -472,6 +564,24 @@ mod tests {
         assert!(second > first);
         assert_eq!(m.conn_epoch_us(), second);
     }
+
+    #[test]
+    fn an_adopted_conn_epoch_is_read_back_and_never_moves_backwards() {
+        let m = SourceMetrics::default();
+        let worker = m.clone();
+        m.set_conn_epoch_us(1_791_321_000_000_000);
+        assert_eq!(worker.conn_epoch_us(), 1_791_321_000_000_000);
+        m.set_conn_epoch_us(1_791_320_000_000_000);
+        assert_eq!(worker.conn_epoch_us(), 1_791_321_000_000_000);
+        worker.set_conn_epoch_us(1_791_321_000_000_001);
+        assert_eq!(m.conn_epoch_us(), 1_791_321_000_000_001);
+        let minted = m.next_conn_epoch_us();
+        assert!(minted > 1_791_321_000_000_001, "{minted}");
+        m.set_conn_epoch_us(1_791_321_000_000_001);
+        assert_eq!(worker.conn_epoch_us(), minted);
+        assert!(worker.next_conn_epoch_us() > minted);
+        assert_eq!(m.snapshot(), SourceMetricsSnapshot::default());
+    }
     use super::*;
 
     #[test]
@@ -488,5 +598,86 @@ mod tests {
         assert_eq!(s.flush_failures, 1);
         assert_eq!(s.msgs, 0);
         assert_eq!(a.snapshot(), b.snapshot());
+    }
+
+    #[test]
+    fn onchain_counters_accumulate_and_the_tip_gauge_keeps_its_latest_value() {
+        let a = SourceMetrics::default();
+        let b = a.clone();
+        a.bump_filtered_out();
+        b.bump_filtered_out();
+        a.bump_slot_gaps();
+        b.add_blocks_lost(4);
+        a.add_blocks_lost(3);
+        a.add_late_txs(2);
+        b.add_late_txs(5);
+        a.add_partial_banks_discarded(1);
+        b.add_abandoned_banks(6);
+        a.bump_fanout_overflow();
+        b.bump_votes_excluded();
+        b.bump_votes_excluded();
+        a.bump_tx_error_decode_failures();
+        a.set_behind_tip_slots(40);
+        b.set_behind_tip_slots(12);
+        let s = a.snapshot();
+        assert_eq!(
+            (
+                s.filtered_out,
+                s.slot_gaps,
+                s.blocks_lost,
+                s.late_txs,
+                s.partial_banks_discarded,
+                s.abandoned_banks,
+                s.fanout_overflow,
+                s.votes_excluded,
+                s.tx_error_decode_failures,
+            ),
+            (2, 1, 7, 7, 1, 6, 1, 2, 1)
+        );
+        assert_eq!(s.behind_tip_slots, 12, "the gauge holds the last value set");
+        assert_eq!(a.snapshot(), b.snapshot());
+        assert_eq!(
+            (s.gaps, s.resyncs, s.reconnects),
+            (0, 0, 0),
+            "on-chain counters never touch the book counters"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_the_onchain_counters_reads_them_as_zero() {
+        let mut value = serde_json::to_value(SourceMetricsSnapshot {
+            gaps: 3,
+            republished: 1,
+            ..SourceMetricsSnapshot::default()
+        })
+        .unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "filtered_out",
+            "slot_gaps",
+            "blocks_lost",
+            "late_txs",
+            "partial_banks_discarded",
+            "abandoned_banks",
+            "fanout_overflow",
+            "votes_excluded",
+            "tx_error_decode_failures",
+            "behind_tip_slots",
+        ] {
+            assert_eq!(object.remove(field), Some(serde_json::json!(0)), "{field}");
+        }
+        let back: SourceMetricsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            back,
+            SourceMetricsSnapshot {
+                gaps: 3,
+                republished: 1,
+                ..SourceMetricsSnapshot::default()
+            }
+        );
+        assert_eq!(
+            SourceMetrics::default().snapshot(),
+            SourceMetricsSnapshot::default()
+        );
     }
 }

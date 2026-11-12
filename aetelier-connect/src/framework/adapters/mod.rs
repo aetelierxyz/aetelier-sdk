@@ -35,6 +35,8 @@ pub mod kraken;
 pub mod kucoin;
 pub mod okx;
 pub mod poloniex;
+#[cfg(feature = "grpc")]
+pub mod solana;
 pub mod upbit;
 
 #[cfg(test)]

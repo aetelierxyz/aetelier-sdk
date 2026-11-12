@@ -91,6 +91,25 @@ fn certifying_kinds_carry_structured_ids() {
         "book_delta_application",
         "book_invariants",
         "gap_detection",
+        "feed_lifecycle",
+        #[cfg(feature = "grpc")]
+        "tx_decode_surface",
+        #[cfg(feature = "grpc")]
+        "slot_assembly",
+        #[cfg(feature = "grpc")]
+        "slot_reorder",
+        #[cfg(feature = "grpc")]
+        "tx_dedup",
+        #[cfg(feature = "grpc")]
+        "slot_gap_detection",
+        #[cfg(feature = "grpc")]
+        "slot_tick_grid",
+        #[cfg(feature = "grpc")]
+        "address_match_roles",
+        #[cfg(feature = "grpc")]
+        "failed_inclusion",
+        #[cfg(feature = "grpc")]
+        "tx_invariants",
     ] {
         let kind = KINDS
             .iter()

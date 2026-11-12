@@ -14,14 +14,23 @@ repository or on the docs site does not exist. Do not infer one.
 
 ## Binaries
 
-Declared in `aetelier-sdk/Cargo.toml`.
+Declared in `aetelier-sdk/Cargo.toml`. Release binaries are built by
+`.github/workflows/release.yml`.
 
-| Binary | Package | Feature |
-|---|---|---|
-| `md_worker` | `aetelier-sdk` | `parquet` |
-| `validate` | `aetelier-sdk` | `parquet` |
-| `rehydrate` | `aetelier-sdk` | `parquet` |
-| `entrepot` | `aetelier-sdk` | default |
+| Binary | Package | Required feature | Release build |
+|---|---|---|---|
+| `md_worker` | `aetelier-sdk` | `parquet` | `--features parquet,grpc` |
+| `validate` | `aetelier-sdk` | `parquet` | `--features parquet,grpc` |
+| `rehydrate` | `aetelier-sdk` | `parquet` | `--features parquet,grpc` |
+| `entrepot` | `aetelier-sdk` | default | not released |
+
+`md_worker` exits `0` after a stop or shutdown, `1` on a startup error, and `78` when every worker ended `Rejected` after a terminal gRPC rejection; a supervisor must not restart it after `78`.
+
+`grpc` compiles in the `solana` venue (`market_type = "onchain"`,
+`transport = "grpc"`). `aetelier-sdk/serve/md_worker.Dockerfile` builds
+`md_worker` with `--features parquet,grpc` as well. An `md_worker` built
+without `grpc` refuses a valid `solana` manifest with an error naming the
+feature.
 
 ## Offline verification
 
@@ -29,10 +38,12 @@ The conformance suite replays committed wire fixtures through the production
 decode path. It requires no credentials and no network:
 
 ```
-cargo test -p aetelier-connect --test conformance
+cargo test -p aetelier-connect --test conformance --features grpc
 ```
 
-Fixtures and their provenance: `aetelier-connect/datasets/README.md`.
+Fixtures and their provenance: `aetelier-connect/datasets/README.md`. The
+`solana` captures are not distributed; without them under
+`aetelier-connect/datasets/solana/` its stream kinds report not applicable.
 
 ## Scope
 

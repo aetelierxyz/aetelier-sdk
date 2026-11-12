@@ -9,6 +9,7 @@ Writers persist exactly what the engine reconstructed: order books, trades, liqu
 ## Module map
 
 - `trades`, `orderbooks`, `liquidations`, `funding`, `open_interest` — per-datatype Parquet writers and readers plus JSON/CSV variants.
+- `onchain` — the `transactions.v1` Parquet writer and reader, and `check_transactions` behind `validate` T11–T13.
 - `sink` — `ParquetSnapshotFlusher`, the all-or-nothing flush implementation behind the worker's buffered sink.
 - `rehydrate` — batch repair: reads persisted trade parquets, fetches the venue's REST trades over the same id range, set-differences by id, and writes a dense `*_rehydrated` file beside the immutable originals, reporting anything retention makes unrecoverable.
 - `flush` — the legacy extension-trait flush path, retained for compatibility.

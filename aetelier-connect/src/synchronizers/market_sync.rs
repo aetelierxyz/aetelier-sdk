@@ -5,7 +5,7 @@
 //!
 //! # Clock Modes
 //!
-//! The synchronizer supports four clock modes via [`ClockMode`]:
+//! The synchronizer supports these clock modes via [`ClockMode`]:
 //!
 //! - **OrderbookDriven** (default): Grid periods are triggered by orderbook
 //!   timestamp crossings, matching the original `MarketSynchronizer` behavior.
@@ -52,6 +52,7 @@
 use aetelier_types::{
     funding::{FundingRate, FundingSettlement},
     liquidations::Liquidation,
+    onchain::Transaction,
     open_interest::OpenInterest,
     orderbooks::Orderbook,
     snapshots::MarketSnapshot,
@@ -77,6 +78,7 @@ struct PeriodEvents {
     funding: Vec<FundingRate>,
     open_interest: Vec<OpenInterest>,
     funding_settlements: Vec<FundingSettlement>,
+    transactions: Vec<Transaction>,
 }
 
 /// The grid clock mode — single definition in `aetelier_types` (the
@@ -138,6 +140,8 @@ pub struct MarketSynchronizer {
     /// Most recent open interest records (state-based, carried forward).
     current_open_interests: Vec<OpenInterest>,
 
+    current_transactions: Vec<Transaction>,
+
     // -- Output --------------------------------------------------------------
     /// Buffered output snapshots.
     pub buffer: Vec<MarketSnapshot>,
@@ -181,6 +185,7 @@ impl MarketSynchronizer {
             current_funding_rates: Vec::new(),
             current_funding_settlements: Vec::new(),
             current_open_interests: Vec::new(),
+            current_transactions: Vec::new(),
             buffer: Vec::new(),
             total_captured: 0,
             late_events_dropped: 0,
@@ -217,6 +222,11 @@ impl MarketSynchronizer {
     #[inline]
     pub fn liquidation_driven(period_us: u64) -> Self {
         Self::with_clock_mode(period_us, ClockMode::LiquidationDriven)
+    }
+
+    #[inline]
+    pub fn slot_driven(period_us: u64) -> Self {
+        Self::with_clock_mode(period_us, ClockMode::SlotDriven)
     }
 
     /// Returns the active clock mode.
@@ -319,6 +329,16 @@ impl MarketSynchronizer {
                 self.current_open_interests.push(oi);
             }
         }
+        for tx in std::mem::take(&mut self.current_transactions) {
+            let row = tx.source_tx_ts_us / self.period_us + 1;
+            if row <= prev_period {
+                late += 1;
+            } else if row <= last_emitted {
+                out.entry(row).or_default().transactions.push(tx);
+            } else {
+                self.current_transactions.push(tx);
+            }
+        }
         for fs in std::mem::take(&mut self.current_funding_settlements) {
             let row = (fs.local_ts_us / self.period_us + 1).max(prev_period + 1);
             if row <= last_emitted {
@@ -394,6 +414,7 @@ impl MarketSynchronizer {
                 funding_rate: bundle.funding,
                 open_interest: bundle.open_interest,
                 funding_settlements: bundle.funding_settlements,
+                transactions: bundle.transactions,
             };
             self.buffer.push(snap);
         }
@@ -442,6 +463,17 @@ impl MarketSynchronizer {
             return 0;
         }
         self.advance_grid(ts_us as u128)
+    }
+
+    pub fn on_slot_tick(&mut self, block_time_us: u64) -> usize {
+        if self.finalized {
+            self.drop_post_finalize();
+            return 0;
+        }
+        if self.clock_mode != ClockMode::SlotDriven {
+            return 0;
+        }
+        self.advance_grid(block_time_us as u128)
     }
 
     /// Feed an orderbook snapshot.
@@ -522,6 +554,7 @@ impl MarketSynchronizer {
                 funding_rate: bundle.funding,
                 open_interest: bundle.open_interest,
                 funding_settlements: bundle.funding_settlements,
+                transactions: bundle.transactions,
             };
             self.buffer.push(snap);
         }
@@ -614,6 +647,14 @@ impl MarketSynchronizer {
         self.current_open_interests.push(oi);
     }
 
+    pub fn on_transaction(&mut self, tx: Transaction) {
+        if self.finalized {
+            self.drop_post_finalize();
+            return;
+        }
+        self.current_transactions.push(tx);
+    }
+
     // -- Finalization --------------------------------------------------------
 
     /// Emit the final snapshot, closing the current (incomplete) period.
@@ -646,6 +687,7 @@ impl MarketSynchronizer {
         let funding_rates = std::mem::take(&mut self.current_funding_rates);
         let open_interests = std::mem::take(&mut self.current_open_interests);
         let settlements = std::mem::take(&mut self.current_funding_settlements);
+        let transactions = std::mem::take(&mut self.current_transactions);
 
         for (symbol, period) in periods {
             let ts = (period + 1) * self.period_us;
@@ -660,6 +702,7 @@ impl MarketSynchronizer {
                 funding_rate: funding_rates.clone(),
                 open_interest: open_interests.clone(),
                 funding_settlements: settlements.clone(),
+                transactions: transactions.clone(),
             };
 
             self.buffer.push(snap);
@@ -682,6 +725,7 @@ impl MarketSynchronizer {
         let funding_rates = std::mem::take(&mut self.current_funding_rates);
         let open_interests = std::mem::take(&mut self.current_open_interests);
         let settlements = std::mem::take(&mut self.current_funding_settlements);
+        let transactions = std::mem::take(&mut self.current_transactions);
 
         let snap = MarketSnapshot {
             ts_us: ts,
@@ -693,6 +737,7 @@ impl MarketSynchronizer {
             funding_rate: funding_rates,
             open_interest: open_interests,
             funding_settlements: settlements,
+            transactions,
         };
 
         self.buffer.push(snap);

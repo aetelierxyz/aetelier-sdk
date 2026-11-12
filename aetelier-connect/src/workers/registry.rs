@@ -35,10 +35,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
+use aetelier_types::Instrument;
 use aetelier_types::WorkerId;
 use aetelier_types::exchanges::{Exchange, MarketType};
 use aetelier_types::synchronizers::WorkerMode;
-use aetelier_types::trading_pair::TradingPair;
 
 use crate::clients::connection_state::ConnectionState;
 
@@ -82,8 +82,8 @@ pub struct WorkerStatus {
     pub id: WorkerId,
     /// Exchange this worker is connected to.
     pub exchange: Exchange,
-    /// Canonical trading pair.
-    pub pair: TradingPair,
+    /// Canonical instrument: a `BASE/QUOTE` trading pair or a chain address.
+    pub pair: Instrument,
     /// Instrument market type.
     pub market_type: MarketType,
     /// Processing mode (Raw or Clock-driven with parameters).
@@ -121,6 +121,34 @@ pub struct WorkerStatus {
 }
 
 impl WorkerStatus {
+    pub fn initial(
+        id: WorkerId,
+        exchange: Exchange,
+        pair: impl Into<Instrument>,
+        market_type: MarketType,
+        mode: WorkerMode,
+        sinks: Vec<String>,
+        datatypes: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            exchange,
+            pair: pair.into(),
+            market_type,
+            mode,
+            connection_state: ConnectionState::Connecting,
+            messages_per_sec: 0.0,
+            total_events: 0,
+            reconnect_count: 0,
+            sinks,
+            datatypes,
+            feeds: Vec::new(),
+            uptime_secs: 0.0,
+            ws_latency_us: None,
+            source_metrics: Default::default(),
+        }
+    }
+
     /// Convenience: is this worker actively streaming data?
     pub fn is_live(&self) -> bool {
         self.connection_state.is_live()
@@ -376,4 +404,111 @@ pub struct RegistryCounts {
     pub error: usize,
     /// Workers in [`ConnectionState::Paused`].
     pub paused: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::budget::SourceMetricsSnapshot;
+    use aetelier_types::onchain::ChainAddress;
+    use aetelier_types::synchronizers::ClockMode;
+    use aetelier_types::trading_pair::TradingPair;
+
+    const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+
+    #[test]
+    fn initial_status_is_connecting_with_zeroed_counters() {
+        let id = WorkerId::new();
+        let mode = WorkerMode::Clock {
+            clock: ClockMode::TradeDriven,
+            period_us: 100_000,
+        };
+        let status = WorkerStatus::initial(
+            id,
+            Exchange::Bybit,
+            TradingPair::new("BTC", "USDT"),
+            MarketType::Perpetual,
+            mode,
+            vec!["upstream".into()],
+            vec!["orderbook".into(), "trades".into()],
+        );
+
+        assert_eq!(status.id, id);
+        assert_eq!(status.exchange, Exchange::Bybit);
+        assert_eq!(
+            status.pair,
+            Instrument::Pair(TradingPair::new("BTC", "USDT"))
+        );
+        assert_eq!(status.market_type, MarketType::Perpetual);
+        assert_eq!(status.mode, mode);
+        assert_eq!(status.connection_state, ConnectionState::Connecting);
+        assert_eq!(status.messages_per_sec, 0.0);
+        assert_eq!(status.total_events, 0);
+        assert_eq!(status.reconnect_count, 0);
+        assert_eq!(status.sinks, ["upstream"]);
+        assert_eq!(status.datatypes, ["orderbook", "trades"]);
+        assert!(status.feeds.is_empty());
+        assert_eq!(status.uptime_secs, 0.0);
+        assert!(status.ws_latency_us.is_none());
+        assert_eq!(status.source_metrics, SourceMetricsSnapshot::default());
+    }
+
+    #[test]
+    fn cex_status_json_keeps_the_pair_string() {
+        let pair = TradingPair::new("BTC", "USDT");
+        let status = WorkerStatus::initial(
+            WorkerId::new(),
+            Exchange::Bybit,
+            pair.clone(),
+            MarketType::Perpetual,
+            WorkerMode::Raw,
+            vec!["upstream".into()],
+            vec!["trades".into()],
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["pair"], "BTC/USDT");
+        assert_eq!(json["pair"], serde_json::to_value(&pair).unwrap());
+
+        let emitted = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "exchange": "bybit",
+            "pair": "BTC/USDT",
+            "market_type": "perpetual",
+            "mode": "Raw",
+            "connection_state": "Streaming",
+            "messages_per_sec": 12.5,
+            "total_events": 42,
+            "reconnect_count": 1,
+            "sinks": ["upstream"],
+            "uptime_secs": 3.0
+        }"#;
+        let received: WorkerStatus = serde_json::from_str(emitted).unwrap();
+        assert_eq!(received.pair, Instrument::Pair(pair));
+        let round_trip = serde_json::to_value(&received).unwrap();
+        assert_eq!(round_trip["pair"], "BTC/USDT");
+        let again: WorkerStatus = serde_json::from_value(round_trip.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap(), round_trip);
+    }
+
+    #[test]
+    fn address_status_json_is_the_bare_base58() {
+        let address = ChainAddress::solana(JUPITER_V6).unwrap();
+        let status = WorkerStatus::initial(
+            WorkerId::new(),
+            Exchange::Solana,
+            address,
+            MarketType::Onchain,
+            WorkerMode::Clock {
+                clock: ClockMode::SlotDriven,
+                period_us: 1_000_000,
+            },
+            vec!["parquet".into()],
+            vec!["transactions".into()],
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["pair"], JUPITER_V6);
+        let back: WorkerStatus = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.pair, Instrument::Address(address));
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
 }

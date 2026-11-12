@@ -53,6 +53,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use crate::errors::ConfigError;
+use crate::onchain::MatchRole;
 use crate::synchronizers::ClockMode;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +169,8 @@ pub struct DataTypesSection {
     /// Open interest updates feed.
     #[serde(default)]
     pub open_interest: FeedToggle,
+    #[serde(default)]
+    pub transactions: TransactionsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -177,15 +180,17 @@ pub enum DeclaredDatatype {
     Liquidations,
     FundingRates,
     OpenInterest,
+    Transactions,
 }
 
 impl DeclaredDatatype {
-    pub const ALL: [DeclaredDatatype; 5] = [
+    pub const ALL: [DeclaredDatatype; 6] = [
         DeclaredDatatype::Orderbook,
         DeclaredDatatype::Trades,
         DeclaredDatatype::Liquidations,
         DeclaredDatatype::FundingRates,
         DeclaredDatatype::OpenInterest,
+        DeclaredDatatype::Transactions,
     ];
 
     pub fn id(&self) -> &'static str {
@@ -195,6 +200,7 @@ impl DeclaredDatatype {
             DeclaredDatatype::Liquidations => "liquidations",
             DeclaredDatatype::FundingRates => "funding_rates",
             DeclaredDatatype::OpenInterest => "open_interest",
+            DeclaredDatatype::Transactions => "transactions",
         }
     }
 }
@@ -214,6 +220,7 @@ impl DeclaredSet {
                 DeclaredDatatype::Liquidations => section.liquidations.enabled,
                 DeclaredDatatype::FundingRates => section.funding_rates.enabled,
                 DeclaredDatatype::OpenInterest => section.open_interest.enabled,
+                DeclaredDatatype::Transactions => section.transactions.enabled,
             };
             if on {
                 enabled.insert(dt);
@@ -267,7 +274,7 @@ impl DataTypesSection {
     /// Return the names of all enabled feeds as lowercase strings.
     ///
     /// The order is deterministic: orderbook, trades, liquidations,
-    /// funding_rates, open_interest.
+    /// funding_rates, open_interest, transactions.
     pub fn enabled_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         if self.orderbook.enabled {
@@ -284,6 +291,9 @@ impl DataTypesSection {
         }
         if self.open_interest.enabled {
             names.push("open_interest".into());
+        }
+        if self.transactions.enabled {
+            names.push("transactions".into());
         }
         names
     }
@@ -321,6 +331,34 @@ pub struct FeedToggle {
     /// Whether this feed is enabled.
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, rename = "match")]
+    pub match_role: MatchRole,
+    #[serde(default = "default_include_failed")]
+    pub include_failed: bool,
+    #[serde(default)]
+    pub logs: bool,
+}
+
+impl Default for TransactionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            match_role: MatchRole::default(),
+            include_failed: default_include_failed(),
+            logs: false,
+        }
+    }
+}
+
+fn default_include_failed() -> bool {
+    true
 }
 
 /// `[logs]` — per-event-type print frequency thresholds.
@@ -377,6 +415,8 @@ pub enum SyncMode {
     /// An external wall-clock timer advances the grid.
     #[serde(rename = "on_time")]
     OnTime,
+    #[serde(rename = "on_slot")]
+    OnSlot,
 }
 
 /// Time unit for [`UpdateFrequency`].
@@ -445,12 +485,7 @@ impl MarketSnapshotConfig {
 
     /// Map [`SyncMode`] to the library's [`ClockMode`].
     pub fn clock_mode(&self) -> ClockMode {
-        match self.symbol.sync_mode {
-            SyncMode::OnOrderbook => ClockMode::OrderbookDriven,
-            SyncMode::OnTrade => ClockMode::TradeDriven,
-            SyncMode::OnLiquidation => ClockMode::LiquidationDriven,
-            SyncMode::OnTime => ClockMode::ExternalClock,
-        }
+        self.symbol.sync_mode.clock_mode()
     }
 
     /// Human-readable label for the active clock mode.
@@ -460,6 +495,7 @@ impl MarketSnapshotConfig {
             SyncMode::OnTrade => "ClockMode::TradeDriven",
             SyncMode::OnLiquidation => "ClockMode::LiquidationDriven",
             SyncMode::OnTime => "ClockMode::ExternalClock",
+            SyncMode::OnSlot => "ClockMode::SlotDriven",
         }
     }
 
@@ -573,6 +609,18 @@ impl MarketSnapshotConfig {
     }
 }
 
+impl SyncMode {
+    pub const fn clock_mode(self) -> ClockMode {
+        match self {
+            SyncMode::OnOrderbook => ClockMode::OrderbookDriven,
+            SyncMode::OnTrade => ClockMode::TradeDriven,
+            SyncMode::OnLiquidation => ClockMode::LiquidationDriven,
+            SyncMode::OnTime => ClockMode::ExternalClock,
+            SyncMode::OnSlot => ClockMode::SlotDriven,
+        }
+    }
+}
+
 impl std::fmt::Display for SyncMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -580,6 +628,7 @@ impl std::fmt::Display for SyncMode {
             Self::OnTrade => write!(f, "on_trade"),
             Self::OnLiquidation => write!(f, "on_liquidation"),
             Self::OnTime => write!(f, "on_time"),
+            Self::OnSlot => write!(f, "on_slot"),
         }
     }
 }

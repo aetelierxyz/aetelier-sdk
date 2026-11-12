@@ -17,9 +17,9 @@
 
 # aetelier-sdk
 
-A Rust engine for high-frequency market-microstructure data: live connectivity to 13 crypto exchanges, verified order-book reconstruction, trade loss accounting, grid synchronization, and columnar Parquet I/O — built for quant researchers who need to trust every row.
+A Rust engine for high-frequency market-microstructure data: live connectivity to 13 crypto exchanges and to Solana on-chain transactions, verified order-book reconstruction, trade loss accounting, grid synchronization, and columnar Parquet I/O — built for quant researchers who need to trust every row.
 
-Every venue decoder is certified by a conformance suite that replays real captured wire frames through the production decode path on every CI run: seeding, delta application, sequence-gap detection, checksum validation, trade continuity, and physical book invariants (never crossed, strictly positive, ordered). Exact decimal arithmetic in memory; analytics-friendly Float64 Parquet on disk.
+Every exchange decoder is certified by a conformance suite that replays real captured wire frames through the production decode path on every CI run: seeding, delta application, sequence-gap detection, checksum validation, trade continuity, and physical book invariants (never crossed, strictly positive, ordered). Exact decimal arithmetic in memory; analytics-friendly Float64 Parquet on disk.
 
 Machine-readable entry point: [AGENTS.md](AGENTS.md).
 
@@ -64,7 +64,7 @@ Depend on the workspace via git, pinned to the release tag:
 
 ```toml
 [dependencies]
-aetelier-sdk = { git = "https://github.com/aetelierxyz/aetelier-sdk", tag = "v0.1.1", features = ["parquet"] }
+aetelier-sdk = { git = "https://github.com/aetelierxyz/aetelier-sdk", tag = "v0.1.2", features = ["parquet"] }
 ```
 
 The six crates carry the layout and publish order for a registry release; [CONTRIBUTING.md](CONTRIBUTING.md) documents both.
@@ -74,13 +74,17 @@ The six crates carry the layout and publish order for a registry release; [CONTR
 | Crate | Role |
 |---|---|
 | `aetelier-types` | Canonical no-IO schema crate: trades, order books, liquidations, funding, configs. `forbid(unsafe_code)`. |
-| `aetelier-connect` | Exchange connectivity: WSS transports, per-venue adapters, reconstruction runtime, synchronizers, workers. |
+| `aetelier-connect` | Exchange connectivity: WSS transports, the Yellowstone gRPC transport (feature `grpc`), per-venue adapters, reconstruction runtime, synchronizers, workers. |
 | `aetelier-io` | Columnar persistence: Parquet/JSON/CSV writers and readers, dataset tooling, batch rehydration. |
 | `aetelier-telemetry` | Metrics and log surfaces for collectors. |
 | `aetelier-entrepot` | Object-store transport for aetelier collectors: signed S3 access, listing, retrieval, and archive codecs. |
 | `aetelier-sdk` | The curated facade: one dependency, named re-exports of the recommended path. |
 
 ## Venues
+
+Fourteen venues: thirteen exchanges over WebSocket and, with the `grpc` feature, one chain over gRPC.
+
+### Exchanges
 
 Thirteen venues run the same certified framework path — twelve spot plus hyperliquid perpetuals. Certification means the venue's real captured frames replay through the production decoder in CI across the full conformance matrix: decode surface, seeding taxonomy, symbol canonicalization, book delta application, gap detection, checksum validation where the venue supplies one, trade continuity where the venue's ids permit exact accounting, and physical book/trade invariants.
 
@@ -101,6 +105,18 @@ Thirteen venues run the same certified framework path — twelve spot plus hyper
 | upbit | Spot | `upbit-v1` | FullRefresh |
 
 **Last integration checkpoint: 2026-08-05** — the capture date of the newest venue's conformance fixture (hyperliquid, cycle #5). `Protocol` is the venue's pinned wire revision: a bump the venue ships that this repo has not adopted fails at boot rather than decoding wrong. `Book model` is the reconstruction the adapter declares — full-refresh snapshots, sequence-validated deltas, checksum-validated deltas, or per-order L3.
+
+### On-chain
+
+| Venue | Market | Protocol | Datatype | Book model |
+|---|---|---|---|---|
+| solana | Onchain | `yellowstone-grpc-proto@14.0.1` | transactions | Stream |
+
+`solana` reads the transactions that involve each watched address, one base58 address per worker, from a Yellowstone gRPC (Geyser) endpoint and writes them as `transactions.v1` Parquet. It is compiled in only with the `grpc` Cargo feature, off by default; the release `md_worker`, `validate` and `rehydrate` binaries and the image from `aetelier-sdk/serve/md_worker.Dockerfile` include it.
+
+Its manifest sets `market_type = "onchain"`, `transport = "grpc"` with a `[collect.grpc]` section (`endpoint`; `x_token_env` names the variable holding the provider's token when it needs one), `[collect.datatypes.transactions]`, and `sync_mode = "on_slot"`, which advances the grid on chain time. Every subscribe starts at the chain tip, so an outage is recorded as one exact slot gap in the gap ledger and is not backfilled.
+
+`Protocol` is the pinned `yellowstone-grpc-proto` release; a rejected gRPC status names it alongside the server's version. `Stream` keeps no book. With `grpc`, the conformance matrix certifies `solana` on Yellowstone captures placed under `aetelier-connect/datasets/solana/` (finalized and confirmed windows, a quiet address, a forced reconnect, an unfiltered window); the captures are not distributed with the repository, and without them the stream kinds report not applicable: transaction decoding, slot assembly and reorder, duplicate suppression, the exact slot gap, the slot-driven grid, address match roles, failed-transaction inclusion and the `transactions.v1` record checks.
 
 ## Data honesty
 

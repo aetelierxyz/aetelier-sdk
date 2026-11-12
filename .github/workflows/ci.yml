@@ -55,11 +55,17 @@ jobs:
       - name: cargo clippy (parquet-gated, workspace, blocking)
         run: cargo clippy --locked --workspace --all-targets --features aetelier-sdk/parquet -- -D warnings
 
+      - name: cargo clippy (parquet + grpc, workspace, blocking)
+        run: cargo clippy --locked --workspace --all-targets --features aetelier-sdk/parquet,aetelier-sdk/grpc -- -D warnings
+
       - name: cargo nextest (unit + integration)
         run: cargo nextest run --locked --workspace
 
       - name: cargo nextest (parquet-gated suites, workspace)
         run: cargo nextest run --locked --workspace --features aetelier-sdk/parquet
+
+      - name: cargo nextest (parquet + grpc suites, workspace)
+        run: cargo nextest run --locked --workspace --features aetelier-sdk/parquet,aetelier-sdk/grpc
 
       - name: cargo test (doc tests)
         run: cargo test --locked --workspace --doc
@@ -111,6 +117,9 @@ jobs:
       - name: cargo nextest (parquet-gated suites, workspace)
         run: cargo nextest run --locked --workspace --features aetelier-sdk/parquet
 
+      - name: cargo nextest (parquet + grpc suites, workspace)
+        run: cargo nextest run --locked --workspace --features aetelier-sdk/parquet,aetelier-sdk/grpc
+
   features:
     name: per-crate feature matrix
     runs-on: ubuntu-24.04
@@ -124,7 +133,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo hack check (each feature per crate)
-        run: cargo hack check --locked --workspace --each-feature --exclude-features torch
+        run: cargo hack check --locked --workspace --each-feature
+
+      - name: cargo check (all features, workspace)
+        run: cargo check --locked --workspace --all-targets --all-features
 
   msrv:
     name: MSRV (1.99.0)
@@ -149,7 +161,7 @@ jobs:
           tool: cargo-deny
       - uses: Swatinem/rust-cache@v2
       - name: cargo deny check
-        run: cargo deny check advisories bans licenses sources
+        run: cargo deny --features aetelier-sdk/parquet,aetelier-sdk/grpc check advisories bans licenses sources
 
   ci-green:
     name: ci-green
