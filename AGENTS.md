@@ -41,7 +41,9 @@ decode path. It requires no credentials and no network:
 cargo test -p aetelier-connect --test conformance --features grpc
 ```
 
-Fixtures and their provenance: `aetelier-connect/datasets/README.md`.
+Fixtures and their provenance: `aetelier-connect/datasets/README.md`. The
+`solana` captures are not distributed; without them under
+`aetelier-connect/datasets/solana/` its stream kinds report not applicable.
 
 ## Scope
 

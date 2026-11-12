@@ -81,7 +81,10 @@ subscribe request and reads the provider token from the variable named by
 GRPC_X_TOKEN=<token> cargo run -p aetelier-connect --example capture_grpc --features grpc -- --endpoint https://solana-yellowstone-grpc.publicnode.com:443 --seconds 60 --out /tmp/solana_capture.jsonl JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
 ```
 
-The `solana/` files were captured on 2026-11-10 from
+The `solana/` files are not distributed with the repository. The conformance
+suite replays them when they sit under `datasets/solana/`; without them its
+stream kinds report not applicable, and the sha256 column below checks a copy.
+They were captured on 2026-11-10 from
 `https://solana-yellowstone-grpc.publicnode.com:443` in this way, one
 subscription per file. Each request has one transaction filter (`vote: false`,
 failed transactions kept, the watched address in `account_include`, or no

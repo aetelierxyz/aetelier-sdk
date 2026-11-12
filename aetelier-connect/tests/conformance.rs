@@ -537,6 +537,7 @@ fn conformance_matrix() {
         println!("  {:<24} -> {}", k.name, k.atlas);
     }
     let mut certified = std::collections::HashSet::new();
+    let mut not_replayed = std::collections::HashSet::new();
     for desc in WIRED {
         let outcomes: Vec<harness::Outcome> =
             kinds::KINDS.iter().map(|k| (k.run)(desc)).collect();
@@ -550,6 +551,11 @@ fn conformance_matrix() {
             };
             if matches!(outcome, harness::Outcome::Pass) {
                 certified.insert(k.name);
+            }
+            if let harness::Outcome::NotApplicable(reason) = outcome
+                && reason.contains(harness::CAPTURES_NOT_DISTRIBUTED)
+            {
+                not_replayed.insert(k.name);
             }
             row.push(format!("{}={}", k.name, cell));
         }
@@ -571,6 +577,10 @@ fn conformance_matrix() {
     }
     println!("=====================================\n");
     for k in kinds::KINDS.iter().filter(|k| !k.invariants.is_empty()) {
+        if !certified.contains(k.name) && not_replayed.contains(k.name) {
+            println!("{:<24} not replayed: its captures are absent", k.name);
+            continue;
+        }
         assert!(
             certified.contains(k.name),
             "kind {} certifies {:?} but passes on no wired venue",

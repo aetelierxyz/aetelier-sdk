@@ -21,8 +21,8 @@ use aetelier_types::trading_pair::TradingPair;
 use rust_decimal::Decimal;
 
 use super::harness::{
-    Class, ExpectInstrument, Kind, Outcome, StreamFixture, VenueConformance,
-    fixture_lines, fixture_raw, stream_frames,
+    CAPTURES_NOT_DISTRIBUTED, Class, ExpectInstrument, Kind, Outcome, StreamFixture,
+    VenueConformance, fixture_lines, fixture_present, fixture_raw, stream_frames,
 };
 
 fn stateless_replay_applies(model: &ReconstructionModel) -> Result<(), Outcome> {
@@ -1107,6 +1107,16 @@ pub fn stream_fixtures(
         return Err(Outcome::Fail(
             "stream venue declares no stream fixture".into(),
         ));
+    }
+    if !desc
+        .stream_fixtures
+        .iter()
+        .any(|fixture| fixture_present(fixture.file))
+    {
+        return Err(Outcome::NotApplicable(format!(
+            "the {} {CAPTURES_NOT_DISTRIBUTED}: place them under datasets/{}/ to replay them",
+            desc.venue, desc.venue
+        )));
     }
     Ok(desc.stream_fixtures)
 }

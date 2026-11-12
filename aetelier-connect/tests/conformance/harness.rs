@@ -166,6 +166,16 @@ pub fn fixture_raw(rel: &str) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("fixture {rel} unreadable: {e}"))
 }
 
+pub const CAPTURES_NOT_DISTRIBUTED: &str =
+    "captures are not distributed with the repository";
+
+pub fn fixture_present(rel: &str) -> bool {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("datasets")
+        .join(rel)
+        .is_file()
+}
+
 pub fn stream_frames(rel: &str) -> Result<Vec<ReplayFrame>, String> {
     let lines = fixture_lines(rel)?;
     if lines.is_empty() {
