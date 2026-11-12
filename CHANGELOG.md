@@ -8,6 +8,12 @@ entry is edited only to correct a factual error, never to restate its scope.
 
 ### Promotions
 
+## v0.1.2 — 2026-11-12
+
+### Promotions
+
+- 2026-11-12 · `feature/onchain-solana` — the `solana` venue over Yellowstone gRPC (feature `grpc`): `transactions.v1` Parquet, the slot clock, slot heartbeats on quiet windows; `md_worker` exits `78` when every worker is rejected.
+
 ### Added
 
 - `aetelier_types::onchain`: `Chain`, `ChainAddress` (case-preserving base58, validated to 32 bytes), `Instrument`, and the `Transaction` record with `MatchRole`, `Commitment`, `TransactionVersion` (`legacy`, `v0`, `v1`) and `TransactionFailure`. `DeclaredDatatype::Transactions`, the `[datatypes.transactions]` feed (`enabled`, `match`, `include_failed`, `logs`) and `MarketSnapshot.transactions`.

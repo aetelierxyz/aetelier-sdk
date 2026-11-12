@@ -182,9 +182,9 @@ name = "timestamp_source_ts"
 path = "tests/timestamp_source_ts.rs"
 
 [dependencies]
-aetelier-entrepot = { path = "../aetelier-entrepot", version = "0.1.1" }
-aetelier-telemetry = { path = "../aetelier-telemetry", version = "0.1.1", optional = true }
-aetelier-types = { path = "../aetelier-types", version = "0.1.1" }
+aetelier-entrepot = { path = "../aetelier-entrepot", version = "0.1.2" }
+aetelier-telemetry = { path = "../aetelier-telemetry", version = "0.1.2", optional = true }
+aetelier-types = { path = "../aetelier-types", version = "0.1.2" }
 anyhow = { version = "1.0" }
 async-rate-limiter = { version = "1.0", features = ["rt-tokio"] }
 async-trait = { version = "0.1" }
@@ -222,7 +222,7 @@ base64 = { version = "0.22" }
 futures = { version = "0.3" }
 hyper-util = { version = "0.1", features = ["tokio"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["frame", "std"] }
-aetelier-types = { path = "../aetelier-types", version = "0.1.1" }
+aetelier-types = { path = "../aetelier-types", version = "0.1.2" }
 futures-util = "0.3"
 serde_json = { version = "1.0", features = ["raw_value"] }
 tempfile = "3"

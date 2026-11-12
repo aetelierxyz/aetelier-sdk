@@ -1,6 +1,6 @@
 # md_worker.Dockerfile
 #
-# Standalone market-data collector for v0.1.1 deployment.
+# Standalone market-data collector for v0.1.2 deployment.
 # Builds the aetelier-sdk `md_worker` binary; runs with a TOML manifest
 # mounted at /configs/manifest.toml, writes parquet to /data.
 #
@@ -12,7 +12,7 @@
 # `aetelier-connect::workers::output::build_sinks`.
 #
 # Build context: the parent of this repository
-#   docker build -t aetelier-md-worker:v0.1.1 \
+#   docker build -t aetelier-md-worker:v0.1.2 \
 #                -f aetelier-sdk/aetelier-sdk/serve/md_worker.Dockerfile .
 
 # ── Stage 1: builder ──────────────────────────────────────────────────────────

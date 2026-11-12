@@ -7,14 +7,14 @@
 # can compute deltas across runs.
 #
 # Build context: the parent of this repository
-#   docker build -t aetelier-validate:v0.1.1 \
+#   docker build -t aetelier-validate:v0.1.2 \
 #                -f aetelier-sdk/aetelier-sdk/serve/validate.Dockerfile .
 #
 # Run on demand:
 #   docker run --rm \
 #     -v /var/lib/aetelier/datasets:/data:ro \
 #     -v /var/lib/aetelier/validate-state:/state \
-#     aetelier-validate:v0.1.1 \
+#     aetelier-validate:v0.1.2 \
 #     --flush-threshold 3600 --grid-period-us 100000 --verbose
 #
 # Notes
