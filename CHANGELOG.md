@@ -8,6 +8,8 @@ entry is edited only to correct a factual error, never to restate its scope.
 
 ### Promotions
 
+- 2026-11-15 · `ci/release-github-hosted` (#31) — the `release` workflow runs on GitHub-hosted `ubuntu-24.04` runners, and a `workflow_dispatch` `tag` input builds an existing tag and attaches its binaries without moving the tag.
+
 ## v0.1.2 — 2026-11-12
 
 ### Promotions
