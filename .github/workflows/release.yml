@@ -10,24 +10,26 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing version tag to build and attach, e.g. v0.1.2"
+        type: string
+        required: true
 
 permissions:
   contents: write
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
   gates:
-    # Self-hosted, not ubuntu-latest: this workflow triggers on `push: tags`
-    # ONLY — there is no pull_request path, so a fork can never run code here
-    # (pushing a tag requires write access). That keeps self-hosted safe even
-    # on a public repo, unlike ci.yml which does take pull_request.
-    #
-    # Third-party actions are pinned to a commit SHA, not a moving tag: a
-    # self-hosted runner is not ephemeral, so an upstream tag repoint would
-    # execute on it directly. Bump these by hand; the trailing comment records
-    # the tag each SHA resolved from.
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - name: install rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: taiki-e/install-action@9e3720000324bf314ab081346108fc3bab8d6b74 # nextest
@@ -45,11 +47,13 @@ jobs:
         include:
           # Linux/X64 is built natively, no cross-compilation. macOS is not
           # built here: released Docker images are Linux and never need one.
-          - os: [self-hosted, Linux, X64]
+          - os: ubuntu-24.04
             triple: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - name: install rust toolchain
         run: rustup toolchain install --no-self-update
       - name: build release binaries
@@ -59,9 +63,9 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           for b in md_worker validate rehydrate; do
-            cp "target/release/$b" "dist/${b}-${{ github.ref_name }}-${{ matrix.triple }}"
+            cp "target/release/$b" "dist/${b}-${TAG}-${{ matrix.triple }}"
           done
       - name: attach to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" dist/* --clobber
+        run: gh release upload "$TAG" dist/* --clobber
