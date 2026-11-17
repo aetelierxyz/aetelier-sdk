@@ -5,7 +5,9 @@
 version = 2
 yanked = "warn"
 # Add a RUSTSEC id here (with a comment) to consciously accept one advisory.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; no maintained release or safe upgrade exists" },
+]
 
 [bans]
 # The rustls line is single (0.23) after the transport modernization. Remaining
